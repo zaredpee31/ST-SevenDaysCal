@@ -40,6 +40,7 @@ export function createPluginUpdates({ moduleUrl = import.meta.url, extensionType
   };
   const check = () => {
     checkedOnce = true;
+    return Promise.resolve(publish({ status: 'stable', versionInfo: null, error: '' }));
     if (pending) return pending;
     publish({ ...state, status: 'checking', error: '' });
     pending = (async () => {
