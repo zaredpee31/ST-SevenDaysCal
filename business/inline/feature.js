@@ -36,12 +36,9 @@ export function createInlineFeature(env = {}) {
     const parseCalendar = env.parseCalendar;
     const weatherGlyph = env.weatherGlyph;
     const calHasEra = env.calHasEra;
-    const validRealDate = env.validRealDate;
     const formatStoryClockHeadParts = env.formatStoryClockHeadParts;
-    const formatCalendarDate = env.formatCalendarDate;
     const storyClockEnabled = env.storyClockEnabled;
     const latestStoryClock = env.latestStoryClock;
-    const parseJudgedDate = env.parseJudgedDate;
     const readStore = env.readStore;
     const getLinesCacheKey = env.getLinesCacheKey;
     const parseLines = env.parseLines;
@@ -58,34 +55,6 @@ export function createInlineFeature(env = {}) {
 
     // 轴块的历法渲染由 axisInlineRenderer 持有；最新楼读实时数据，历史楼使用快照。
     const _buildAlmanacBlockHtml = (...args) => axisInlineRenderer.buildAlmanacBlock(...args);
-    const _almanacStripDayHtml = (...args) => axisInlineRenderer.buildAlmanacDay(...args);
-
-    // 日历块 per-day tap：点某格 → 下方就地展开当天安排（再点同格收起、点别格切换）。委托到 document、
-    // 只注册一次——块会被 #chat observer 反复重建，不能绑在块自身上；只对 .sp-alm-strip-live 可交互条生效。
-    // 注：格子在 <details> 的 body 内，点它不触发 summary 的展开/收起，两套交互互不打架。
-    function initAlmanacStripDelegation() {
-        $(doc).on('click.spalmstrip', '.sp-dash .sp-alm-strip-live .sp-alm-scell', function (e) {
-            e.preventDefault();
-            e.stopPropagation();   // 别冒泡到 ST 的楼层点击（编辑等）
-            const wrap = this.closest('.sp-alm-strip-live');
-            if (!wrap) return;
-            const sday = wrap.querySelector('.sp-alm-sday');
-            if (!sday) return;
-            if (this.classList.contains('sp-alm-scell-open')) {   // 点已展开的格 → 收起
-                this.classList.remove('sp-alm-scell-open');
-                sday.hidden = true;
-                sday.innerHTML = '';
-                return;
-            }
-            wrap.querySelectorAll('.sp-alm-scell-open').forEach(c => c.classList.remove('sp-alm-scell-open'));
-            this.classList.add('sp-alm-scell-open');
-            const { snap, resolvedCalendar, resolution, readOnly } = inlineTapContext(this);
-            if (readOnly && !resolution?.resolved) { sday.innerHTML = '<div class="sp-alm-sday-empty">历法未知 / 日期未知</div>'; sday.hidden = false; return; }
-            sday.innerHTML = _almanacStripDayHtml(Number(this.dataset.doy), snap ? (snap.almanac || []) : null, resolvedCalendar, inlineTapContext(this).localWeekdayRef);
-            sday.hidden = false;
-        });
-    }
-
     // 点块委托给 pointInlineRenderer；最新楼读当前用户数据，历史楼读快照且只读。
     const _buildScheduleBlockHtml = (...args) => pointInlineRenderer.buildScheduleBlock(...args);
 
@@ -160,7 +129,7 @@ export function createInlineFeature(env = {}) {
         else pending.frame = requestFrame(() => runExpandScrollFrame(pending));
     };
     const initExpandScrollDelegation = () => {
-        const selector = '.sp-inline-box.sp-dash > summary, .sp-inline-box.sp-dash > .sp-dash-body > details.sp-dash-region[data-seg] > summary';
+        const selector = '.sp-inline-box.sp-dash > summary, .sp-inline-box.sp-dash > .sp-dash-body > details.sp-dash-region[data-seg] > summary, .sp-inline-box.sp-dash details.sp-alm-event > summary';
         $(doc).on('click.spinlinescroll', selector, function (event) {
             cancelExpandScroll();
             if (event.defaultPrevented || event.isDefaultPrevented?.()) return;
@@ -208,80 +177,24 @@ export function createInlineFeature(env = {}) {
         return false;
     }
 
-    // 今头（masthead）：大日期块。月/日 + 周几为主体；天气取点当天格；纪年名(era)由日历描述符驱动，
-    // 有则点亮、无则不撑（公历默认无 era）。anchor 缺则退活锚点。
-    function dashMastheadHtml(snap, floorClock = null, calendarOverride = undefined, weekdayRefOverride = undefined) {
-        let anchor = dashAnchor(snap);
-        if (storyClockEnabled() && floorClock) {
-            // 历史楼的结构化日期已按该楼快照历法校验，优先沿用，避免当前历法误判后退回快照锚点。
-            const parsedDate = floorClock.endMeta?.date || floorClock.startMeta?.date;
-            const floorDate = parsedDate || parseJudgedDate(floorClock.end, calendarOverride) || parseJudgedDate(floorClock.start, calendarOverride);
-            if (floorDate) anchor = floorDate;
-        }
-        const cal = calendarOverride === undefined ? loadCalDesc() : calendarOverride;
-        let wd = '星期未记录';
-        try {
-            const meta = floorClock?.endMeta?.valid ? floorClock.endMeta : (floorClock?.startMeta?.valid ? floorClock.startMeta : null);
-            const localRef = weekdayRefOverride !== undefined ? weekdayRefOverride : (meta?.weekdayIndex == null ? (!snap ? almWeekdayRef(cal) : null) : { refDoy: almDayOfYear(meta.month, meta.day, cal), refWd: meta.weekdayIndex });
-            const wdIndex = almWeekdayFor(anchor.month, anchor.day, localRef, cal);
-            if (wdIndex != null) wd = ALM_WEEKDAYS[wdIndex] || '星期未记录';
-        } catch { /* unknown */ }
-        // 天气：从点当天格（days[0].weather）拿；拿不到留空。历史楼用快照点 raw。
-        let wxHtml = '';
-        try {
-            const raw = snap ? (snap.point || '') : readCacheRaw(getCacheKey('user', ''));
-            if (raw) {
-                const wx = String(parseCalendar(raw, cal).days?.[0]?.weather || '').trim();
-                if (wx) wxHtml = `<span class="sp-dash-today-wx">${weatherGlyph(wx)}</span>`;
-            }
-        } catch { /* 天气拿不到就不显 */ }
-        // 纪年位：日历描述符带 era（纪年名）时点亮，无则不撑。
-        const storyEra = typeof anchor.eraLabel === 'string' && anchor.eraLabel.trim() ? anchor.eraLabel.trim() : '';
-        const classical = cal?.displayStyle === 'classical';
-        const eraHtml = (!classical || storyEra) && calHasEra(cal) && cal.era !== storyEra ? `<span class="sp-dash-today-era">${escapeHtml(cal.era)}</span>` : '';
-        const storyYearHtml = anchor.year != null ? `<span class="sp-dash-today-year">${escapeHtml(`${cal?.displayStyle === 'classical' ? String(anchor.year) : anchor.year}年`)}</span>` : '';
-        const storyEraHtml = storyEra ? `<span class="sp-dash-today-era">${escapeHtml(storyEra)}</span>` : '';
-        const dateGroups = classical && typeof formatCalendarDate === 'function'
-            ? `<span class="sp-dash-today-year">${escapeHtml(formatCalendarDate({ ...anchor, eraLabel: storyEra }, cal, calMonthName, 'year'))}</span><span class="sp-dash-today-monthday">${escapeHtml(formatCalendarDate(anchor, cal, calMonthName, 'monthDay'))}</span>`
-            : `<span class="sp-dash-today-md">${storyEraHtml}${storyYearHtml}<span class="sp-dash-today-month">${escapeHtml(calMonthName(cal, anchor.month))}</span><span class="sp-dash-today-day">${anchor.day}日</span></span>`;
-        return `<div class="sp-dash-today">
-            ${dateGroups}
-            <span class="sp-dash-today-wd">${wd}</span>
-            ${(wxHtml || eraHtml) ? `<span class="sp-dash-today-meta">${wxHtml}${eraHtml}</span>` : ''}
-        </div>`;
-    }
-
-    // 折叠态（整框收成一小条）的摘要内层：今 M/D 周X ☀ + 计数 chips（历N 点N 线N）。
-    // 「今 M/D 周X + 天气」是今天的身份标识，只要拿得到日期就恒显——不受点/线/历子开关影响
+    // 折叠态（整框收成一小条）的摘要内层：当前日期/星期/天气/时刻与真实模块计数。
+    // 当前日期和天气是该楼的时间身份，只要拿得到日期就恒显——不受点/线/历子开关影响
     // （子开关只管展开面板里那几个区显不显，日期/天气来自剧情锚点+点数据，与显示开关无关）。
     // chips 则跟着子开关走：只给「开着且有内容」的区计数（关掉的区不该在摘要里冒计数）。
     // flat=true：整框只剩这一条（点线历都关但有日期）→ 用 <div> 包、无折叠箭头、不可展开。
-    // 时间戳·窄条抬戳：最新楼扫到戳时，戳「抬」成当天身份（end 优先）——
-    //   数字戳（2024-10-08 15:10 / 10月8日 …）→ 解析成规整「年月日 周几」，把「时」挪到天气之后；
-    //   古风/无法解析（谷雨亥时 / 霜月初三）→ 原样抬（无周几）；完全无戳/关/历史楼 → 锚点兜底日期。
-    //   周几：有年且公历按真年算(JS Date)，否则用与锚点同源的年-free 周几（自定义历法也走这条）。
-    //   与展开区 storyClockBarHtml（带标签+起→止）互补。
-    // 从戳原文抠数字日期/时刻。返回 {year?,month,day,time?}；抠不出数字日期 → null（交回原样抬）。
-    function stampDate(stamp) {
-        const s = String(stamp || '');
-        let year = null, month = null, day = null, time = '';
-        let m;
-        if ((m = s.match(/(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})/))) {
-            year = +m[1]; month = +m[2]; day = +m[3];
-        } else if ((m = s.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日?/))) {
-            month = +m[1]; day = +m[2];
-        }
-        if (!month || !day || month < 1 || month > 12 || day < 1 || day > 31) return null;   // 非数字日期 → 原样抬
-        if (year != null && !validRealDate(year, month, day)) return null;                  // 严格拒绝 Date 自动归一化日期
-        if ((m = s.match(/(\d{1,2})\s*[:：]\s*(\d{2})/)))   time = `${+m[1]}:${m[2]}`;
-        else if ((m = s.match(/(\d{1,2})\s*[时點点]/)))     time = `${+m[1]}时`;
-        return { year, month, day, time };
-    }
+    // 时间戳元数据由 story-clock 一次解析；日期/星期/时刻交显示层按该楼历法组装。
+    // 无戳或关闭时回锚点；无法解析的旧自由文本保原显示，不猜未知星期。
     // 组窄条「今 …」那截：自定义历法只信通过当前月序/日数校验的结构化戳；
     // 越界或无精确日期时回退已确认锚点，不能把 raw/公历数字回退冒充成今天。
     function clockHeadParts(isLatest, a, anchorWd, floorClock = null, calendarOverride = undefined) {
         const renderCalendar = calendarOverride === undefined ? loadCalDesc() : calendarOverride;
-        const format = options => formatStoryClockHeadParts({ anchor: a, anchorWeekday: anchorWd, calendar: renderCalendar, monthName: calMonthName, escapeHtml, ...options });
+        const format = (options = {}) => {
+            const parts = formatStoryClockHeadParts({ anchor: a, anchorWeekday: anchorWd, calendar: renderCalendar, monthName: calMonthName, escapeHtml, ...options });
+            const date = options.clockMeta?.valid ? options.clockMeta : a;
+            const displayedEra = String(date?.eraLabel || (renderCalendar?.displayStyle === 'classical' ? renderCalendar?.era : '') || '').trim();
+            if (calHasEra(renderCalendar) && renderCalendar.era !== displayedEra && !parts.todayHtml.includes(escapeHtml(renderCalendar.era))) parts.todayHtml += `<span class="sp-dash-sum-era">${escapeHtml(renderCalendar.era)}</span>`;
+            return parts;
+        };
         const fallback = format();
         if (!storyClockEnabled()) return fallback;
         let clk = floorClock;
@@ -291,18 +204,9 @@ export function createInlineFeature(env = {}) {
         const stamp = clk && (clk.end || clk.start);
         if (!stamp) return fallback;
         const tip = '时间戳·主楼 AI 每楼隐形打点读回';
-        const clockMeta = clk?.endMeta?.valid ? clk.endMeta : (clk?.startMeta?.valid ? clk.startMeta : null);
-        if (clockMeta) {
-            const weekdayText = clockMeta.weekdayIndex == null ? (anchorWd || '星期未记录') : (ALM_WEEKDAYS[clockMeta.weekdayIndex] || '星期未记录');
-            return format({ clockMeta: { ...clockMeta, weekdayText }, tip });
-        }
-        const customCalendar = renderCalendar
-            && renderCalendar.kind !== 'gregorian'
-            && renderCalendar.id !== 'default-gregorian';
-        if (customCalendar) return fallback;
-        const p = stampDate(stamp);
-        if (!p) return format({ rawStamp: stamp, tip });   // 古风/无法解析 → 原样抬
-        return format({ stampDate: p, tip });
+        const clockMeta = clk?.endMeta?.valid ? clk.endMeta : (clk?.startMeta?.valid ? clk.startMeta : (clk?.endMeta || clk?.startMeta));
+        const weekdayText = clockMeta?.weekdayIndex == null ? null : (ALM_WEEKDAYS[clockMeta.weekdayIndex] || '星期未记录');
+        return format({ clockMeta: clockMeta ? { ...clockMeta, ...(weekdayText ? { weekdayText } : {}) } : null, rawStamp: stamp, tip });
     }
     function dashSummaryHtml(snap, hasDate, almOn, schOn, linesOn, flat = false, isLatest = false, floorClock = null, calendarOverride = undefined, weekdayRefOverride = undefined, ledgerOn = false) {
         const renderCalendar = calendarOverride === undefined ? loadCalDesc() : calendarOverride;
@@ -366,9 +270,9 @@ export function createInlineFeature(env = {}) {
         const resolvedResult = isLatest ? { resolved: true, calendar: loadCalDesc() } : snapshot.resolveSnapshotCalendar(snap, { fallback: fallbackRecord, marker: !!fallbackRecord, current: loadCalDesc() });
         const resolvedCalendar = resolvedResult.calendar;
         if (!resolvedCalendar) return '<div class="sp-inline-box sp-dash sp-inline-box-ro"><div class="sp-dash-summary sp-dash-summary-flat">历法未知 / 日期未知</div></div>';
-        // 轴渲染返回 summary/upHtml/stripHtml；点、线和标注池返回内容或空字符串。
+        // 轴渲染返回标题与全量事项；点、线和标注池返回内容或空字符串。
         const localWeekdayRef = isLatest ? undefined : createWeekdayConsumerContext({ snapshotRef: snap?.weekdayRef, floor, resolveLocal: f => storyWeekdayRefPure(getContext(), resolvedCalendar, ALM_CHAT_SCAN_LIMIT, f) }).weekdayRef;
-        const alm        = _buildAlmanacBlockHtml(snap ? (snap.almanac || []) : null, snap ? snap.anchor : null, resolvedCalendar, localWeekdayRef);
+        const alm        = _buildAlmanacBlockHtml(snap ? (snap.almanac || []) : null, snap ? snap.anchor : null, resolvedCalendar);
         const schInner   = _buildScheduleBlockHtml(snap ? (snap.point || '') : null, readOnly, resolvedCalendar, localWeekdayRef);
         const linesInner = linesFeature.inlineHtml(snap ? (snap.line || '') : null, readOnly, coldItems ?? snap?.cold);
         // 标注池：AI 楼实际打捞到的暗历条目（快照 pool 字段驱动；最新楼读活账，空则不出块）。
@@ -378,30 +282,18 @@ export function createInlineFeature(env = {}) {
         const hasDateData = hasDateContext(snap);
         if (!alm && !schInner && !linesInner && !ledgerInner && !hasDateData) return '';
 
-        // 展开面板仅在轴或点区域存在时显示日期大头。
-        const hasDateRegion = !!alm || !!schInner;
-
         const collapseControl = label => `<button type="button" class="sp-inline-region-collapse" aria-label="收起${label}" title="收起${label}">${icon("chevron-up")}<span>收起</span></button>`;
         const region = (cls, seg, label, inner) => inner
             ? `<details class="${cls} sp-dash-region" data-seg="${seg}" open>${inner}${collapseControl(label)}</details>`
             : '';
 
-        // 有历时顶行包含日期大头和历内容；只有点区时顶行只显示日期大头。
-        let top = '';
-        if (alm) {
-            // 历整块：满宽 summary 头（点它折叠整个历单元）+ [方形今头 + 即将到来清单] 行 + 满宽六格条。
-            // summary 占满通栏；今头、清单与六格条一起放入 details，依靠原生折叠同步收起。
-            const dashTop  = `<div class="sp-dash-top">${dashMastheadHtml(snap, floorClock, resolvedCalendar, localWeekdayRef)}<div class="sp-inline-body sp-alm-inline-body">${alm.upHtml}</div></div>`;
-            const stripRow = alm.stripHtml ? `<div class="sp-alm-strip-region">${alm.stripHtml}</div>` : '';
-            top = `<details class="sp-almanac-inline sp-dash-region" data-seg="almanac" open>${alm.summary}${dashTop}${stripRow}${collapseControl('历模块')}</details>`;
-        } else if (hasDateRegion) {
-            top = `<div class="sp-dash-top sp-dash-top-noalm">${dashMastheadHtml(snap, floorClock, resolvedCalendar, localWeekdayRef)}</div>`;
-        }
+        // 日期只留外层摘要，轴内每个事项按当前历法显示自己的日期范围。
+        const top = alm ? region('sp-almanac-inline', 'almanac', '轴模块', `${alm.summary}${alm.itemsHtml}`) : '';
         const schRegion   = region('sp-schedule-inline', 'schedule', '点模块', schInner);
         const linesRegion = region('sp-lines-inline', 'lines', '线模块', linesInner);
         const ledgerRegion = region('sp-ledger-inline', 'ledger', '标注池模块', ledgerInner);
 
-        // 段序：轴(top) → 标注池 → 点 → 线。标注池与日历同属「轴」范畴，紧贴轴放；点/线在其下。
+        // 段序：轴 → 标注池 → 点 → 线。标注池紧贴轴，点/线在其下。
         const body = `${top}${ledgerRegion}${schRegion}${linesRegion}`;
         // 没有可展开区域但有日期数据时显示纯日期条。
         if (!body) {
@@ -463,6 +355,8 @@ export function createInlineFeature(env = {}) {
         if (typeof rendered.node.open === 'boolean') rendered.open = rendered.node.open;
         rendered.regions = Object.fromEntries([...rendered.node.querySelectorAll(':scope > .sp-dash-body > details.sp-dash-region[data-seg]')]
             .map(region => [region.getAttribute('data-seg'), region.open === true]));
+        rendered.items = Object.fromEntries([...rendered.node.querySelectorAll('details.sp-alm-event[data-alm-id]')]
+            .filter(item => item.getAttribute('data-alm-id')).map(item => [item.getAttribute('data-alm-id'), item.open === true]));
     };
     const releaseRenderedBox = rendered => {
         if (!rendered) return;
@@ -527,7 +421,7 @@ export function createInlineFeature(env = {}) {
         el?.querySelectorAll?.(BOX_SELECTOR)?.forEach(box => box.remove());
     };
     const directBoxes = msg => [...(msg?.querySelectorAll?.(':scope > ' + BOX_SELECTOR) || [])];
-    const mount = (el, isLatest) => {
+    const mount = (el, isLatest, { freezeSnapshots = true } = {}) => {
         if (!pluginEnabled() || !el) return;
         syncRenderedChat();
         const msg = el.querySelector?.('.mes_text');
@@ -537,7 +431,7 @@ export function createInlineFeature(env = {}) {
         const renderKey = renderedBoxKey(el);
         let snap = null, coldItems = null;
         if (isLatest) {
-            const frozen = env.freezeSnapshot?.(mid);
+            const frozen = freezeSnapshots ? env.freezeSnapshot?.(mid) : env.readSnapshot?.(Number(mid));
             if (!isUser && Array.isArray(frozen?.cold)) coldItems = frozen.cold;
         }
         else {
@@ -571,7 +465,11 @@ export function createInlineFeature(env = {}) {
             const seg = region.getAttribute('data-seg');
             if (Object.hasOwn(rendered?.regions || {}, seg)) region.open = rendered.regions[seg] === true;
         });
-        const nextRendered = { node: box, html, isLatest, open: box.open === true, regions: rendered?.regions };
+        box.querySelectorAll('details.sp-alm-event[data-alm-id]').forEach(item => {
+            const id = item.getAttribute('data-alm-id');
+            if (id && Object.hasOwn(rendered?.items || {}, id)) item.open = rendered.items[id] === true;
+        });
+        const nextRendered = { node: box, html, isLatest, open: box.open === true, regions: rendered?.regions, items: rendered?.items };
         renderedBoxes.set(renderKey, nextRendered);
         box.addEventListener('toggle', () => {
             const current = renderedBoxes.get(renderKey);
@@ -587,7 +485,7 @@ export function createInlineFeature(env = {}) {
             for (const entry of entries) {
                 const el = entry.target;
                 const latest = el === current.currentEl;
-                if (entry.isIntersecting) mount(el, latest);
+                if (entry.isIntersecting) mount(el, latest, { freezeSnapshots: false });
                 else if (!latest) unmount(el);
             }
         }, { root: null, rootMargin: '200px 0px', threshold: 0 });
@@ -601,7 +499,7 @@ export function createInlineFeature(env = {}) {
             const latest = el === current.currentEl;
             if (current.winSet.has(el)) {
                 inlineObserver?.observe(el);
-                if (latest || inViewport(el)) mount(el, latest);
+                if (latest || inViewport(el)) mount(el, latest, { freezeSnapshots: shared?.freezeSnapshots !== false });
             } else {
                 inlineObserver?.unobserve(el);
                 unmount(el);
@@ -635,7 +533,7 @@ export function createInlineFeature(env = {}) {
                 const context = env.getContext?.() || {};
                 const window = computeWindow(floors);
                 env.coordinateChanged?.({ floors, context });
-                if (!env.isStreaming?.()) refresh(true, { floors, context, window });
+                if (!env.isStreaming?.()) refresh(true, { floors, context, window, freezeSnapshots: false });
             }, 400);
         });
         chatObserver.observe(chat, { childList: true, subtree: true });
@@ -646,7 +544,7 @@ export function createInlineFeature(env = {}) {
         ensureInlineObserver();
         bindChatObserver();
         if (!delegated) {
-            if ($) { initAlmanacStripDelegation(); initScheduleStripDelegation(); initRegionCollapseDelegation(); initExpandScrollDelegation(); }
+            if ($) { initScheduleStripDelegation(); initRegionCollapseDelegation(); initExpandScrollDelegation(); }
             delegated = true;
         }
     };
@@ -660,7 +558,7 @@ export function createInlineFeature(env = {}) {
         refreshTimer = chatMutationTimer = chatRetryTimer = null;
         refreshInput = null;
         cancelExpandScroll();
-        if ($) $(doc).off('.spalmstrip').off('.spschstrip').off('.spinlineregioncollapse').off('.spinlinescroll');
+        if ($) $(doc).off('.spschstrip').off('.spinlineregioncollapse').off('.spinlinescroll');
         delegated = false;
         clear();
         renderedBoxes.clear();

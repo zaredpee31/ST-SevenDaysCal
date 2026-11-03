@@ -22,6 +22,14 @@ test('theater story context freezes card/recent inputs before launching shared W
     assert.match(context.sysBlocks.join('\n'), /标注已验证摘要与尚未摘要的近期正文/);
 });
 
+test('theater memory query uses the frozen requested story and cancellation signal', async () => {
+    const controller = new AbortController(); const owner = { input: '想重访过去灯塔的约定', controller }; let passed;
+    const build = createTheaterStoryContext({ getContext: () => ({ chatId: 'c', chat: [] }), readCardExtras: () => ({}), getRecentMesIds: () => [1, 2], getMemText: async options => { passed = options; return '灯塔旧事'; }, owners: { isValid: () => true } });
+    const context = await build(owner);
+    assert.deepEqual(passed, { excludeMesIds: [1, 2], query: owner.input, signal: controller.signal });
+    assert.ok(context.sysBlocks.join('\n').includes('灯塔旧事'));
+});
+
 test('theater story context does not convert a failed selected memory read into an empty summary', async () => {
     const failure = Object.assign(new Error('selected memory read failed'), { diagnosticCode: 'memory-read' });
     const build = createTheaterStoryContext({
@@ -127,26 +135,4 @@ test('permanent theater title can be edited after its draft has been removed', a
     assert.equal(repository.loadDrafts('A').length, 0);
     assert.equal((await repository.updateSavedTitle({ chatId: 'A', metadata }, 'only-saved', 'Renamed', { savedBaseline: baseline })).ok, true);
     assert.equal(metadata.saved[0].title, 'Renamed');
-});
-
-test('external theater persistence still dispatches through its record saver', async () => {
-    const metadata = { saved: [], version: 1 };
-    const calls = [];
-    const metadataSaver = {
-        capture: (target, after) => ({ target, after }),
-        dispatch: async (captured, options) => { calls.push({ captured, options }); return { ok: true, commitState: 'confirmed' }; },
-    };
-    const repository = createTheaterRepository({
-        metadata: () => metadata,
-        metadataSaver,
-        requireFixedSaver: true,
-    });
-    const result = await repository.promoteToSaved({
-        chatId: 'A', external: true, metadata, target: { recordId: 'record-A' }, metadataSnapshot: {}, isCurrent: () => true,
-    }, piece('external'));
-    assert.equal(result.ok, true);
-    assert.equal(result.commitState, 'confirmed');
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].captured.target.recordId, 'record-A');
-    assert.equal(calls[0].captured.after['sp-theater'].saved[0].id, 'external');
 });

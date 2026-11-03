@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectVisibleChatHistory } from '../business/lines/history.js';
+import { getSharedBodyWrappers } from '../utils/shared-body-wrappers.js';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const indexSource = fs.readFileSync(path.join(repo, 'index.js'), 'utf8');
@@ -41,39 +42,6 @@ test('delayed chat UI callback runs against the live view without a boundary ref
     assert.equal(calls, 1);
 });
 
-test('exclusion restore stops if the live character is excluded', async () => {
-    const region = productionFunctions('async function restoreCurrentCharacterAfterExclusion() {', 'function getLegacyWiFilter() {');
-    const chain = { removeClass() { return this; }, addClass() { return this; }, show() { return this; }, hide() { return this; }, empty() { return this; }, text() { return this; } };
-    const makeHarness = () => {
-        const load = deferred();
-        const calls = { migration: [], bodies: [], load: 0 };
-        const context = { chatId: 'before-await', chatMetadata: {} };
-        let excluded = false;
-        const sandbox = {
-            getContext: () => context,
-            loadExternalChat: () => { calls.load++; return load.promise; },
-            currentCharacterExcluded: () => excluded,
-            store: { migrateChatFromLocalStorage: chatId => { calls.migration.push(chatId); return { status: 'none' }; } },
-            scheduleForChatBoundary() {}, pointState: {},
-            loadCachedForCurrentChat: () => `cache:${context.chatId}`,
-            pluginEnabled: () => true, applyPluginEnabled() {},
-            coordinateRuntime: { feature: { close() {} } },
-            $in: () => chain, $inAll: () => chain,
-            closeTaDrawer() {}, updateTaTriggerLabel() {}, setBody: body => calls.bodies.push(body),
-            renderMemorySection() {}, renderStorageUsage() {}, renderCurrentChatStorageMode() {},
-        };
-        return { calls, load, sandbox, setExcluded: value => { excluded = value; } };
-    };
-
-    const excluded = makeHarness();
-    const restoreExcluded = evaluateFunctionRegion(region, 'restoreCurrentCharacterAfterExclusion', excluded.sandbox);
-    const excludedRestore = restoreExcluded();
-    excluded.setExcluded(true);
-    excluded.load.resolve();
-    assert.equal(await excludedRestore, false);
-    assert.deepEqual(excluded.calls.migration, []);
-});
-
 test('chat creation events have no automatic backend migration listener; chat-change wiring remains', () => {
     const region = productionFunctions('if (_stListeners.chat) eventSource.removeListener?.(event_types.CHAT_CHANGED, _stListeners.chat);', '// 初始化时当前聊天可能已经 ready');
     const registrations = [];
@@ -83,15 +51,15 @@ test('chat creation events have no automatic backend migration listener; chat-ch
         removeListener: (type, handler) => removed.push([type, handler]),
     };
     const sandbox = {
-        _stListeners: { chat: null, diagnosticRetention: null, externalSnapshotPrune: null },
+        _stListeners: { chat: null, diagnosticRetention: null, legacyReturn: null },
         eventSource,
         event_types: { CHAT_CHANGED: 'chat-changed', CHAT_CREATED: 'chat-created', GROUP_CHAT_CREATED: 'group-chat-created', CHARACTER_MESSAGE_RENDERED: 'rendered', MESSAGE_DELETED: 'deleted' },
-        refreshNarrativePacePrompt() {}, currentCharacterExcluded: () => false,
-        refreshDiagnosticRetention() {}, getContext: () => ({ chat: [] }), isExternalMode: () => false,
-        pruneExternalSnapshots() {},
+        currentCharacterExcluded: () => false,
+        refreshDiagnosticRetention() {}, getContext: () => ({ chat: [] }), hasLegacyChatStorage: () => false,
+
     };
     evaluateFunctionRegion(region, 'undefined', sandbox);
-    assert.deepEqual(registrations.map(([type]) => type), ['chat-changed', 'rendered', 'deleted']);
+    assert.deepEqual(registrations.map(([type]) => type), ['chat-changed', 'rendered']);
     assert.ok(!registrations.some(([type]) => type === 'chat-created' || type === 'group-chat-created'));
     assert.equal(removed.length, 0);
     assert.equal(indexSource.includes('handleNewChatStorage'), false);
@@ -135,6 +103,7 @@ test('generation history carries real mesids only for internal memory exclusion,
     const region = productionFunctions('function buildRecentGenerationHistory(ctx, historyLimit, opts = {}) {', 'function outlineWorldInfoTriggerText(history) {');
     const context = evaluateFunctionRegion(region, 'buildGenerationHistoryContext', {
         getSettings: () => ({ keepTags: '', extraTags: '' }),
+        getWrapperSettings: () => getSharedBodyWrappers({}),
         selectVisibleChatHistory,
         substituteParams: value => value,
         sanitizeGenerationContextText: value => String(value).replace(/<erase>[\s\S]*?<\/erase>/g, ''),
@@ -163,6 +132,7 @@ test('discussion recent-floor ids are computed from the exact sanitized visible 
     const region = productionFunctions('function buildRecentChatEntries(ctx, floorCount = 6, perMessageChars = 2500) {', 'function worldInfoMaxContext(ctx) {');
     const helpers = evaluateFunctionRegion(region, '({ buildRecentChatEntries, getRecentVisibleFloorIds })', {
         getSettings: () => ({ keepTags: '', extraTags: '' }),
+        getWrapperSettings: () => getSharedBodyWrappers({}),
         selectVisibleChatHistory,
         memory: { stripTags: value => String(value).replace(/<erase>[\s\S]*?<\/erase>/g, '') },
     });
@@ -242,16 +212,14 @@ test('buildMessages passes internal recent ids to memory but returns only API ro
     assert.deepEqual(JSON.parse(JSON.stringify(messages.at(-2))), { role: 'assistant', content: 'recent floor' });
 });
 
-test('creative outline memory read uses the matching recent-six visible floor ids', async () => {
-    const region = productionFunctions('async function readCreativeChatMemory({ ctx, userMsg, signal, selection, excludeMesIds = [] }) {', 'async function composeCreativeChatMessages(');
+test('间的记忆接口传递本轮查询与匹配的近期六楼排除ID', async () => {
+    const region = productionFunctions('readMemory: (ctx, query) =>', '        readRecent:');
     let options;
-    const read = evaluateFunctionRegion(region, 'readCreativeChatMemory', {
-        memoryPreCheckConfirm: async () => true,
-        creativeChatMemorySelectionCurrent: () => true,
+    const ports = evaluateFunctionRegion('', `({${region}})`, {
         getMemText: async opts => { options = opts; return 'builtin'; },
-        outlineChatMemoryError: message => new Error(message),
+        getRecentVisibleFloorIds: (_ctx, count) => { assert.equal(count, 6); return [12, 14, 15, 16, 17, 18]; },
     });
-    const result = await read({ ctx: {}, userMsg: '讨论', selection: { source: 'builtin' }, excludeMesIds: [12, 14, 15, 16, 17, 18] });
-    assert.equal(result.text, 'builtin');
+    const result = await ports.readMemory({}, '讨论');
+    assert.equal(result, 'builtin');
     assert.deepEqual(JSON.parse(JSON.stringify(options)), { query: '讨论', excludeMesIds: [12, 14, 15, 16, 17, 18] });
 });
