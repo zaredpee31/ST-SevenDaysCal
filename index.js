@@ -1,3 +1,4 @@
+import { readPanelViewport, syncDialogViewport, bindOutsideClose, fitDesktopPanel } from './ui/panel-window.js';
 import { primaryTextColor, syncUiTheme } from './utils/ui-theme.js';
 import { icon, setIcon } from './utils/icons.js';
 import { getContext, extension_settings, extensionNames, extensionTypes } from '../../../extensions.js';
@@ -160,7 +161,7 @@ import { createDateDetectionController } from './business/axis/date-detection.js
 
 // Source and bundled entries both live at the plugin root.
 const EXT_BASE = new URL('.', import.meta.url).href;
-// Both Shadow roots must load the stylesheet paired with this build, even when
+// Owned Shadow roots must load the stylesheet paired with this build, even when
 // the browser still has an older unversioned style.css cached.
 const STYLESHEET_URL = typeof __GOUHUA_STYLESHEET_REVISION__ === 'string'
     ? `${EXT_BASE}style.css?v=${__GOUHUA_STYLESHEET_REVISION__}`
@@ -368,7 +369,7 @@ let _spShadow = null;
 let _spDialogShadow = null;
 let userNameMask = null;
 let userNameMaskDiscovery = [];
-const userNameSurfaceSelector = '.sp-inline-box, .sp-progress-card, #sp-toast-wrap, [data-sp-user-name-surface]';
+const userNameSurfaceSelector = '.sp-inline-box, #sp-portable-import-overlay, #sp-toast-host, [data-sp-user-name-surface]';
 function refreshUserNameMask(scope) { userNameMask?.refresh(scope); }
 function syncUserNameMask() {
     const enabled = getSettings().userNameBlurEnabled === true;
@@ -393,12 +394,12 @@ function syncUserNameMask() {
         if (!root || observed.has(root)) return;
         observed.add(root);
         const observer = new MutationObserver(records => {
-            let changed = false;
+            const changed = new Set();
             for (const record of records) for (const node of [...record.addedNodes, ...record.removedNodes]) {
-                if (ownsSurface(node)) changed = true;
+                if (ownsSurface(node)) changed.add(node);
                 if (node.nodeType === 1 && (node.id === 'chat' || node.querySelector('#chat'))) observe(document.querySelector('#chat'), true);
             }
-            if (changed) refreshUserNameMask();
+            for (const node of changed) refreshUserNameMask(node);
         });
         observer.observe(root, { childList: true, subtree });
         userNameMaskDiscovery.push(observer);
@@ -553,7 +554,7 @@ const pointController = createPointController({
     showPanel,
     setBody,
     loading: loadingHtml,
-    showPrecheckError: message => setBody(`<div class="sp-error">${icon("alert-circle")}<p>${escapeHtml(message || '记忆读取失败，请重试')}</p><div class="sp-point-empty-actions"><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span><button class="sp-gen-btn" id="sp-gen-schedule-now">重新生成点</button></div></div>`),
+    showPrecheckError: message => setBody(`<div class="sp-error">${icon("alert-circle")}<p>${escapeHtml(message || '记忆读取失败，请重试')}</p><div class="sp-point-empty-actions"><button class="sp-gen-btn" id="sp-gen-schedule-now">重新生成点</button><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span></div></div>`),
     recordFailure: (owner, operation, error) => {
         const target = pointPanelTarget(owner?.view, owner?.charName, owner?.chatId, owner?.chatRevision);
         const message = typeof error === 'string' ? error : diagnosticMessage(error);
@@ -3198,14 +3199,17 @@ function injectExtButton() {
 // sp-btn-generating/done，两套并存互不干扰。计数只增减、不直接读 pointState.isGenerating 那些分散旗标，
 // 天然免漏灯/卡灯。
 let _fabBusyCount = 0;
+function getFabButton() {
+    return document.getElementById(FAB_ID)?.shadowRoot?.querySelector('.sp-fab-btn') || null;
+}
 function setFabBusy(on) {
     _fabBusyCount = Math.max(0, _fabBusyCount + (on ? 1 : -1));
-    $(`#${FAB_ID} .sp-fab-btn`).toggleClass('sp-fab-busy', _fabBusyCount > 0);
+    $(getFabButton()).toggleClass('sp-fab-busy', _fabBusyCount > 0);
 }
 
 function setExtBtnState(state) {
     // 魔法棒(#sp_open_wand)生成态变色太不显眼、用户根本看不到，故不再给它挂状态类——生成指示统一交给悬浮球呼吸灯。
-    const $fab = $(`#${FAB_ID} .sp-fab-btn`);
+    const $fab = $(getFabButton());
     $fab.removeClass('sp-btn-generating sp-btn-done');
     if (state) $fab.addClass(`sp-btn-${state}`);
     // 点生成中只锁「我/TA」子切换（本次生成绑定当前视角，中途换视角无意义，另有 .sp-view-btn 守卫兜底）；
@@ -3222,13 +3226,15 @@ function injectFab() {
     const posStyle = (!mobile && savedPos)
         ? `left:${savedPos.left}px;top:${savedPos.top}px;right:auto;bottom:auto;`
         : '';
-    const html = `<div id="${FAB_ID}" style="position:fixed;z-index:2000004;${posStyle}${fabEnabled() && pluginEnabled() ? '' : 'display:none'}">
+    const html = `<div id="${FAB_ID}" style="position:fixed;z-index:2000004;${posStyle}${fabEnabled() && pluginEnabled() ? '' : 'display:none'}"></div>`;
+    document.documentElement.insertAdjacentHTML('beforeend', html);
+    const fab = document.getElementById(FAB_ID);
+    const shadow = fab.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `<link rel="stylesheet" href="${STYLESHEET_URL}">
         <button class="sp-fab-btn sp-${currentTheme}" title="构画"
             style="transform:translateZ(0);clip:auto;">
             ${PEN_ICON_SVG}
-        </button>
-    </div>`;
-    document.documentElement.insertAdjacentHTML('beforeend', html);
+        </button>`;
 
     let wasMobile = isMobile();
     window.addEventListener('resize', () => {
@@ -3256,8 +3262,7 @@ function injectFab() {
         wasMobile = nowMobile;
     });
 
-    const fab = document.getElementById(FAB_ID);
-    const fabButton = fab?.querySelector('.sp-fab-btn');
+    const fabButton = getFabButton();
     if (globalThis.__TAURITAVERN__?.abiVersion >= 1) fab?.setAttribute('data-tt-mobile-surface', 'free-window');
     if (!fab || !fabButton) return;
     fabButton.addEventListener('pointerdown', function (e) {
@@ -3351,6 +3356,8 @@ function injectModal() {
     bindDailyMenuDialogEvents();
     bindWardrobeDialogEvents();
     document.documentElement.appendChild(dialogHost);
+    bindViewportSync();
+    syncDialogViewport(dialogHost);
     const html = `
             <div class="sp-backdrop"></div>
             <div class="sp-sheet">
@@ -3953,7 +3960,7 @@ function injectModal() {
 
                     <div class="sp-main">
                         <div class="sp-body" id="sp-body">
-                            <div class="sp-empty">${icon("calendar")}<p>还没有点</p><div class="sp-point-empty-actions"><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span><button class="sp-gen-btn" id="sp-gen-schedule-now">生成点</button></div></div>
+                            <div class="sp-empty">${icon("calendar")}<p>还没有点</p><div class="sp-point-empty-actions"><button class="sp-gen-btn" id="sp-gen-schedule-now">生成点</button><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span></div></div>
                         </div>
 
                         <div class="sp-outline-wrap" id="sp-outline-wrap" style="display:none">
@@ -4023,7 +4030,7 @@ function injectModal() {
     host.id = MODAL_ID;
     if (globalThis.__TAURITAVERN__?.abiVersion >= 1) host.setAttribute('data-tt-mobile-surface', 'fullscreen-window');
     host.className = `sp-root sp-${currentTheme}`;
-    host.style.cssText = 'display:none;position:fixed;z-index:2000001';
+    host.style.cssText = 'display:none;position:fixed;inset:0;width:100dvw;height:100dvh;pointer-events:none;z-index:2000001';
     const root = host.attachShadow({ mode: 'open' });
     _spShadow = root;
     // 键盘边界：shadow 内 input 的 keydown 是 composed 事件，冒泡到 document 时 ST 的
@@ -4037,8 +4044,8 @@ function injectModal() {
     });
     // shadow 内第一层 wrapper 必须带 sp-root + 主题类：style.css 的 `.sp-root ...` 前缀选择器、
     // .sp-night/.sp-day 色板、.sp-forced-* 强制主题覆盖全靠它匹配
-    // （applyTheme 同步它的主题类）。display:contents 不产生布局盒子，fixed 语义
-    // 仍由 .sp-sheet 承担；host 无 transform/filter，内部 position:fixed 相对视口不变。
+    // （applyTheme 同步它的主题类）。display:contents 不产生布局盒子，主宿主补偿原点后，
+    // .sp-sheet 继续使用可视视口坐标。
     root.innerHTML = `
         <link rel="stylesheet" href="${STYLESHEET_URL}">
         <div class="sp-root sp-${currentTheme}" style="display:contents">${html}</div>`;
@@ -4062,7 +4069,7 @@ function injectModal() {
     _spShadow.addEventListener('click', event => {
         if (!currentCharacterExcluded()) return;
         const target = (event.composedPath?.() || []).find(node => node instanceof Element) || event.target;
-        const allowed = target?.closest?.('#sp-settings-overlay, .sp-settings-btn, .sp-close-btn');
+        const allowed = target?.closest?.('#sp-settings-overlay, .sp-settings-btn, .sp-close-btn, .sp-backdrop');
         if (allowed) return;
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -4086,7 +4093,9 @@ function injectModal() {
         $(this).toggleClass('sp-btn-active', nowEnabled);
     });
     $in('.sp-theme-toggle-btn').on('click', cycleThemeMode);
-    $in('.sp-backdrop').on('click',     closePanel);
+    bindOutsideClose({ target: document, panel: inEl('.sp-sheet'), close: closePanel,
+        canClose: () => isMobile() && host.style.display !== 'none' && !_spDialogShadow?.querySelector('.sp-dialog-overlay, .sp-confirm-overlay'),
+    });
 
     // 模块介绍气泡：点标题旁的 ? 弹出当前模块简介，点外部/切模块即关
     $in('.sp-module-intro-btn').on('click', function (e) {
@@ -5319,14 +5328,14 @@ function openQuickReplyShortcut(key) {
 function showEmptyGenerate() {
     setBody(`<div class="sp-empty">
         ${icon("calendar")}
-        <div class="sp-point-empty-actions"><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span>
-        <button class="sp-gen-btn" id="sp-gen-now">生成点</button></div>
+        <div class="sp-point-empty-actions"><button class="sp-gen-btn" id="sp-gen-now">生成点</button>
+        <span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span></div>
     </div>`);
     $in('#sp-gen-now').on('click', triggerGenerate);
 }
 
 function pointScheduleEmptyHtml() {
-    return `<div class="sp-empty">${icon("calendar")}<p>还没有点</p><div class="sp-point-empty-actions"><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span><button class="sp-gen-btn" id="sp-gen-schedule-now">生成点</button></div></div>`;
+    return `<div class="sp-empty">${icon("calendar")}<p>还没有点</p><div class="sp-point-empty-actions"><button class="sp-gen-btn" id="sp-gen-schedule-now">生成点</button><span class="sp-point-tools"><button class="sp-panel-refresh sp-open-daily-menu" title="今天吃点啥" aria-label="今天吃点啥">${icon("tools-kitchen-2")}</button><button class="sp-panel-refresh sp-open-wardrobe" title="今天穿点啥" aria-label="今天穿点啥">${icon("hanger")}</button></span></div></div>`;
 }
 
 function showPanel() {
@@ -5342,12 +5351,14 @@ function showPanel() {
     else if (hasLegacyChatStorage()) showLegacyChatReturn();
     setTimeout(() => {
         positionPanel();
-        syncMobileViewport();
-        refreshUserNameMask();
+        syncPanelViewport();
+        refreshUserNameMask(_spShadow);
     }, 0);
 }
 
 function closePanel() {
+    onDragEnd(null, false);
+    onResizeEnd(null, false);
     // 关闭主面板时取消活动确认，但独立弹窗宿主本身不隐藏。
     // 收全屏残留：全屏中经背景/FAB 关面板时，若不清这些类，body 的滚动锁会滞留（酒馆卡死），
     // 且 .sp-sheet 的 sp-fs-flat 会带到下次打开（手机右移半屏）。棱、坐标一并清。
@@ -7606,13 +7617,16 @@ function mountPortableImportOverlay() {
     document.getElementById('sp-portable-import-overlay')?.remove();
     const overlay = document.createElement('div');
     overlay.id = 'sp-portable-import-overlay';
+    // Explicit viewport dimensions also cover ST's transformed html with a fixed body.
+    overlay.style.cssText = 'all:initial;position:fixed;inset:0;width:100dvw;height:100dvh;z-index:2147483647';
+    const shadow = overlay.attachShadow({ mode: 'open' });
     const overlayTheme = `sp-${currentTheme}${(getSettings().themeMode || 'auto') !== 'auto' ? ` sp-forced-${currentTheme}` : ''}`;
-    overlay.className = 'sp-progress-overlay';
-    overlay.innerHTML = `<div class="sp-root sp-progress-card sp-dialog-sheet ${overlayTheme}" role="dialog" aria-modal="true">
+    shadow.innerHTML = `<link rel="stylesheet" href="${STYLESHEET_URL}">
+      <div class="sp-progress-overlay"><div class="sp-root sp-progress-card sp-dialog-sheet ${overlayTheme}" role="dialog" aria-modal="true">
         <div class="sp-dialog-head">正在导入所选模块</div>
         <div data-sp-portable-status class="sp-dialog-body">正在应用所选模块并更新界面…</div>
         <button class="sp-dialog-button sp-dialog-button-primary" data-sp-portable-close type="button" hidden>关闭</button>
-    </div>`;
+    </div></div>`;
     const block = event => { if (!overlay.contains(event.target)) { event.preventDefault(); event.stopImmediatePropagation(); } };
     for (const name of ['keydown', 'keyup', 'pointerdown', 'mousedown', 'touchstart', 'click']) document.addEventListener(name, block, true);
     document.documentElement.appendChild(overlay);
@@ -8320,7 +8334,7 @@ function toggleSettings() {
         if (currentCharacterExcluded()) closePanel();
     }
     $in('.sp-settings-btn').toggleClass('sp-btn-active', settingsOpen);
-    syncMobileViewport();
+    syncPanelViewport();
 }
 
 // ─── Memory section renderer + handlers ─────────────────────────────────────
@@ -8378,7 +8392,7 @@ function renderMemorySection() {
     $in('#sp-space-persona').val(typeof s.spacePersona === 'string' ? s.spacePersona : '');   // 间·人格覆盖：同为全局设置，须在按源 early-return 前回填
     $in('#sp-space-use-character-persona').prop('checked', s.spaceUseCharacterPersona === true);
     $in('#sp-space-persona-editor').toggle(s.spaceUseCharacterPersona !== true);
-    refreshUserNameMask();
+    refreshUserNameMask(inEl('#sp-settings-overlay'));
     if (currentCharacterExcluded()) {
         $in('#sp-mem-internal').show();
         $in('#sp-mem-qqj-status, #sp-mem-bbb-status, #sp-mem-anima-status, #sp-mem-database-status').hide();
@@ -9271,8 +9285,11 @@ function syncInlineTheme(theme = detectSTTheme()) {
 function applyTheme(theme) {
     currentTheme = theme;
     const forced = (getSettings().themeMode || 'auto') !== 'auto';
-    const roots = document.querySelectorAll(`#${MODAL_ID}, #${FAB_ID} .sp-fab-btn, #sp-toast-wrap, .sp-progress-card`);
+    const roots = document.querySelectorAll(`#${MODAL_ID}`);
     for (const root of roots) syncUiTheme(root, theme, forced);
+    for (const root of [getFabButton(), getToastContainer(), document.getElementById('sp-portable-import-overlay')?.shadowRoot?.querySelector('.sp-progress-card')]) {
+        if (root) syncUiTheme(root, theme, forced);
+    }
     for (const scope of [_spShadow, _spDialogShadow]) {
         scope?.querySelectorAll('.sp-root').forEach(root => syncUiTheme(root, theme, forced));
     }
@@ -9361,18 +9378,19 @@ function onDragMove(e) {
     const cx = e.touches ? e.touches[0].clientX : e.clientX;
     const cy = e.touches ? e.touches[0].clientY : e.clientY;
     const sheet = inEl('.sp-sheet');
-    const left = Math.max(0, Math.min(dragState.origLeft + cx - dragState.startX, window.innerWidth  - sheet.offsetWidth));
-    const top  = Math.max(0, Math.min(dragState.origTop  + cy - dragState.startY, window.innerHeight - 60));
+    const view = readPanelViewport(window);
+    const left = Math.max(view.left + 10, Math.min(dragState.origLeft + cx - dragState.startX, view.left + view.width - sheet.offsetWidth - 10));
+    const top = Math.max(view.top + 10, Math.min(dragState.origTop + cy - dragState.startY, view.top + view.height - sheet.offsetHeight - 10));
     sheet.style.left  = left + 'px';
     sheet.style.top   = top  + 'px';
     sheet.style.right = 'auto';
 }
 
-function onDragEnd() {
+function onDragEnd(event, persist = true) {
     if (!dragState) return;
     const sheet = inEl('.sp-sheet');
     const rect  = sheet.getBoundingClientRect();
-    if (!isMobile()) {
+    if (persist && !isMobile()) {
         localStorage.setItem(POS_KEY, JSON.stringify({ left: rect.left, top: rect.top }));
     }
     dragState = null;
@@ -9432,34 +9450,25 @@ function onResizeMove(e) {
     resizeRAF = requestAnimationFrame(() => {
         resizeRAF = null;
         const sheet = inEl('.sp-sheet');
-        const mobile = isMobile();
-        // On mobile, we ALSO override max-width (CSS media query caps it at 340px);
-        // without this, inline width can't exceed the cap.
-        const maxW = mobile
-            ? Math.min(window.innerWidth - 10, 500)
-            : window.innerWidth - 10;
-        const w = Math.max(280, Math.min(maxW, resizeState.origW + cx - resizeState.startX));
-        const h = Math.max(300, Math.min(window.innerHeight - 10, resizeState.origH + cy - resizeState.startY));
-        sheet.style.width     = w + 'px';
-        sheet.style.height    = h + 'px';
-        sheet.style.maxHeight = h + 'px';
-        if (mobile) {
-            sheet.style.maxWidth = w + 'px';
-            // Recenter after resize: keep translateX(-50%) if still set, else pin left
-            if (!sheet.style.left || sheet.style.left === '50%') {
-                sheet.style.left = '50%';
-            }
-        }
+        const view = readPanelViewport(window), rect = sheet.getBoundingClientRect();
+        const maxW = Math.max(0, view.left + view.width - rect.left - 10);
+        const maxH = Math.max(0, view.top + view.height - rect.top - 10);
+        const width = Math.max(Math.min(280, maxW), Math.min(maxW, resizeState.origW + cx - resizeState.startX));
+        const height = Math.max(Math.min(300, maxH), Math.min(maxH, resizeState.origH + cy - resizeState.startY));
+        sheet.style.width = width + 'px';
+        sheet.style.height = height + 'px';
+        sheet.style.maxWidth = maxW + 'px';
+        sheet.style.maxHeight = maxH + 'px';
     });
 }
 
-function onResizeEnd() {
+function onResizeEnd(event, persist = true) {
     if (!resizeState) return;
     if (resizeRAF) { cancelAnimationFrame(resizeRAF); resizeRAF = null; }
     const sheet = inEl('.sp-sheet');
     sheet.style.willChange = '';
     document.body.style.userSelect = '';
-    localStorage.setItem(SIZE_KEY, JSON.stringify({ width: sheet.offsetWidth, height: sheet.offsetHeight }));
+    if (persist) localStorage.setItem(SIZE_KEY, JSON.stringify({ width: sheet.offsetWidth, height: sheet.offsetHeight }));
     resizeState = null;
     $(document).off('mousemove.spresize mouseup.spresize');
     document.removeEventListener('touchmove', onResizeMove);
@@ -9469,25 +9478,8 @@ function onResizeEnd() {
 }
 
 function positionPanel() {
-    const sheet = inEl('.sp-sheet');
-    if (!sheet) return;
     bindViewportSync();
-    if (isMobile()) {
-        sheet.style.left      = '';
-        sheet.style.top       = '';
-        sheet.style.right     = '';
-        sheet.style.height    = '';
-        sheet.style.transform = '';
-        syncMobileViewport();
-        return;
-    }
-    let pos = null;
-    try { pos = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); } catch { /* 位置数据损坏则忽略 */ }
-    if (pos) {
-        sheet.style.left  = Math.min(pos.left, window.innerWidth  - sheet.offsetWidth)  + 'px';
-        sheet.style.top   = Math.min(pos.top,  window.innerHeight - 60) + 'px';
-        sheet.style.right = 'auto';
-    }
+    syncPanelViewport();
 }
 
 function bindViewportSync() {
@@ -9495,13 +9487,16 @@ function bindViewportSync() {
     viewportSyncBound = true;
     const onViewportChange = () => {
         closeActionMenus();
+        onDragEnd(null, false);
+        onResizeEnd(null, false);
         if (viewportSyncFrame !== null) return;
-        const callback = () => { viewportSyncFrame = null; syncMobileViewport(); };
+        const callback = () => { viewportSyncFrame = null; syncPanelViewport(); };
         viewportSyncFrame = typeof window.requestAnimationFrame === 'function'
             ? window.requestAnimationFrame(callback)
             : setTimeout(callback, 16);
     };
     window.addEventListener('resize', onViewportChange);
+    window.addEventListener('scroll', onViewportChange);
     window.addEventListener('orientationchange', onViewportChange);
     if (window.visualViewport) {
         window.visualViewport.addEventListener('resize', onViewportChange);
@@ -9509,11 +9504,16 @@ function bindViewportSync() {
     }
 }
 
-function syncMobileViewport() {
-    if (!isMobile()) return;
+function syncPanelViewport() {
+    const dialogHost = document.getElementById(DIALOG_HOST_ID);
+    if (dialogHost) syncDialogViewport(dialogHost);
     const root  = document.getElementById(MODAL_ID);
     const sheet = inEl('.sp-sheet');   // .sp-sheet 在 shadow 内：document.querySelector('#sp-modal-root .sp-sheet') 跨不过边界→null→整个移动端视口同步静默失效；用 inEl 查 shadow root
     if (!root || !sheet || root.style.display === 'none') return;
+    // 保持子面板的视口坐标，抵消宿主根包含块的文档滚动原点。
+    root.style.transform = 'translate(0px, 0px)';
+    const origin = root.getBoundingClientRect();
+    root.style.transform = `translate(${-origin.left}px, ${-origin.top}px)`;
 
     // Read safe-area insets from CSS env() via a probe element.
     // Fallback to 0 when unsupported (older Android browsers).
@@ -9525,29 +9525,30 @@ function syncMobileViewport() {
     const safeBot = parseFloat(cs.bottom) || 0;
     document.body.removeChild(probe);
 
-    const vv = window.visualViewport;
-    const vh = Math.max(320, Math.round((vv?.height || window.innerHeight)));
-    // iOS 软键盘不缩小 layout viewport，而是把可视视口整体上移，visualViewport.offsetTop
-    // 变正；安卓则是直接缩小 layout（offsetTop≈0，靠 vh 变小自适应）。sheet 是
-    // position:fixed（相对 layout viewport 定位），若 top 不叠加 offsetTop，键盘一弹
-    // sheet 就会停在 layout 顶部并离开可视区。叠加 offsetTop 让 sheet 跟随可视视口移到
-    // 键盘上方；安卓 offsetTop≈0，不受该补偿影响。
-    const offsetTop = vv ? Math.max(0, vv.offsetTop) : 0;
-    const marginTop = 20 + safeTop;      // sheet 顶到可视视口顶的留白
-    const bottomGap = 20 + safeBot;
-    const top  = offsetTop + marginTop;  // fixed 绝对值 = 可视视口位移 + 留白
-    const maxH = Math.max(260, vh - marginTop - bottomGap);  // 高度只按可视视口算，不含 offsetTop
-
-    const nextTop = `${top}px`;
-    const nextHeight = `${maxH}px`;
-    if (sheet.style.top === nextTop && sheet.style.height === nextHeight && sheet.style.maxHeight === nextHeight) return;
-
+    const view = readPanelViewport(window);
     const settingsBody = settingsOpen ? inEl('.sp-settings-body') : null;
     const savedScrollTop = settingsBody?.scrollTop;
-    sheet.style.top = nextTop;
-    sheet.style.height = nextHeight;
-    sheet.style.maxHeight = nextHeight;
-
+    if (isMobile()) {
+        sheet.style.left = `${view.left + view.width / 2}px`;
+        // Match QQJ's mobile default; the viewport offset already accounts for keyboard/pan movement.
+        sheet.style.top = `${view.top + Math.max(20, safeTop)}px`;
+        sheet.style.right = 'auto';
+        sheet.style.transform = '';
+        sheet.style.width = `${Math.max(0, view.width - 20)}px`;
+        sheet.style.height = `${Math.max(0, view.height - Math.max(40, safeTop) - Math.max(40, safeBot))}px`;
+        sheet.style.maxWidth = sheet.style.width;
+        sheet.style.maxHeight = sheet.style.height;
+    } else {
+        let savedSize = null, savedPosition = null;
+        try { savedSize = JSON.parse(localStorage.getItem(SIZE_KEY) || 'null'); } catch { /* 忽略损坏的界面尺寸 */ }
+        try { savedPosition = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); } catch { /* 忽略损坏的界面位置 */ }
+        const rect = fitDesktopPanel(view, savedSize, savedPosition);
+        for (const property of ['left', 'top', 'width', 'height']) sheet.style[property] = `${rect[property]}px`;
+        sheet.style.right = 'auto';
+        sheet.style.transform = 'none';
+        sheet.style.maxWidth = `${Math.max(0, view.width - 20)}px`;
+        sheet.style.maxHeight = `${Math.max(0, view.height - 20)}px`;
+    }
     if (!settingsBody) return;
     if (settingsBody.scrollTop !== savedScrollTop) settingsBody.scrollTop = savedScrollTop;
 
@@ -9565,19 +9566,26 @@ function syncMobileViewport() {
 }
 
 // ─── Toast (top) ──────────────────────────────────────────────────────────────
-// toast 容器必须留在 light DOM；检测到第三方主题加载器时，showToast 另走原生 toastr 分支，
-// 由第三方样式作用于原生 toast。全屏提示仍需独立于主窗口显示。
+// 自绘提示使用独立 Shadow Root；第三方提示主题通过 showToast 的 toastr 分支接管。
+
+function getToastContainer() {
+    return document.getElementById('sp-toast-host')?.shadowRoot?.querySelector('#sp-toast-wrap') || null;
+}
 
 function injectToastContainer() {
-    // 带上主题类：#sp-toast-wrap 挂在 <html> 下、在 .sp-root 之外，拿不到 .sp-night/.sp-day
-    // 作用域里的 --sp-*-legacy 令牌。双层背景的不透明底板 var(--sp-surface-legacy) 会落空→透底。
-    // 加 sp-${theme} 把 legacy 令牌带进作用域（applyTheme 会随主题切换更新）。
+    if (document.getElementById('sp-toast-host')) return;
     const nav = globalThis.navigator;
     const userAgent = nav?.userAgent || '';
     const isIos = /iphone|ipad|ipod/i.test(userAgent)
         || ((nav?.maxTouchPoints || 0) > 1 && (nav?.platform === 'MacIntel' || /Macintosh/i.test(userAgent)));
     const tauriIosAttr = globalThis.__TAURITAVERN__?.abiVersion >= 1 && isIos ? ' data-sp-tauritavern-ios' : '';
-    if (!$('#sp-toast-wrap').length) document.documentElement.insertAdjacentHTML('beforeend', `<div id="sp-toast-wrap" class="sp-${currentTheme}"${tauriIosAttr}></div>`);
+    const host = document.createElement('div');
+    host.id = 'sp-toast-host';
+    host.style.cssText = 'all:initial;position:fixed;inset:0;pointer-events:none;z-index:2000002';
+    const shadow = host.attachShadow({ mode: 'open' });
+    const forcedTheme = (getSettings().themeMode || 'auto') !== 'auto' ? ` sp-forced-${currentTheme}` : '';
+    shadow.innerHTML = `<link rel="stylesheet" href="${STYLESHEET_URL}"><div id="sp-toast-wrap" class="sp-${currentTheme}${forcedTheme}"${tauriIosAttr}></div>`;
+    document.documentElement.appendChild(host);
 }
 
 function showToast(msg, onClick, isError = false) {
@@ -9596,14 +9604,14 @@ function showToast(msg, onClick, isError = false) {
         if (isFailure || isInfo) { opts.timeOut = holdMs; opts.extendedTimeOut = holdMs; }
         const toast = (isFailure ? tr.error : isInfo ? tr.info : tr.success)(msg, '', opts);
         const element = toast?.[0] || toast;
-        if (element?.setAttribute) { element.setAttribute('data-sp-user-name-surface', 'toast'); refreshUserNameMask(); }
+        if (element?.setAttribute) { element.setAttribute('data-sp-user-name-surface', 'toast'); refreshUserNameMask(element); }
         return;
     }
     const $t = $(`<div class="sp-toast${isFailure ? ' sp-toast-error' : isInfo ? ' sp-toast-info' : ''}">
         ${icon(isFailure ? 'alert-circle' : isInfo ? 'info-circle' : 'calendar-check')}
         <span>${escapeHtml(msg)}</span>
     </div>`);
-    $('#sp-toast-wrap').append($t);
+    $(getToastContainer()).append($t);
     requestAnimationFrame(() => $t.addClass('sp-toast-show'));
     if (onClick) $t.css('cursor', 'pointer').on('click', () => { onClick(); $t.remove(); });
     else if (isFailure) $t.css('cursor', 'pointer').on('click', () => { $t.removeClass('sp-toast-show'); setTimeout(() => $t.remove(), 350); });   // 失败 toast 停留久，允许点掉提前消失，免堆叠挡视线

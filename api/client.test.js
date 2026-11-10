@@ -19,6 +19,7 @@ globalThis.promptTestContext = { name1: 'User', name2: 'Character', chatMetadata
 const client = await import('./client.js');
 const apiSettings = await import('../runtime/settings.js');
 const { updateSharedProcessingPrompt } = await import('../utils/shared-processing-prompt.js');
+const { buildSpaceChatSystemPrompt } = await import('../business/space/prompts.js');
 const settings = globalThis.promptTestSettings['schedule-planner'];
 const requests = [];
 let completion = 'fixture reply';
@@ -38,10 +39,10 @@ test('first text dispatch inherits the QQJ effective prompt once and ignores for
     globalThis.promptTestSettings.qianqianjie = { processingPrompt: '  INHERITED_RULE\n' };
     await client.postChatCompletion({ cfg, messages: [{ role: 'user', content: 'task' }] });
     assert.equal(settings.processingPrompt, '  INHERITED_RULE\n');
-    assert.equal(requests.at(-1).messages[0].content, '  INHERITED_RULE\n');
+    assert.equal(requests.at(-1).messages[0].content, '  INHERITED_RULE\n\n\n' + client.RESPONSE_STYLE_GUIDE);
     globalThis.promptTestSettings.qianqianjie.processingPrompt = 'LATER_QQJ_LEGACY_RULE';
     await client.postChatCompletion({ cfg, messages: [{ role: 'user', content: 'task' }] });
-    assert.equal(requests.at(-1).messages[0].content, '  INHERITED_RULE\n');
+    assert.equal(requests.at(-1).messages[0].content, '  INHERITED_RULE\n\n\n' + client.RESPONSE_STYLE_GUIDE);
     assert.ok(!JSON.stringify(requests.at(-1)).includes('LEGACY_LOCAL_RULE'));
     assert.ok(!JSON.stringify(requests.at(-1)).includes('LEGACY_WRITING_RULE'));
     assert.equal(settings.customPrompt, 'LEGACY_WRITING_RULE');
@@ -49,7 +50,7 @@ test('first text dispatch inherits the QQJ effective prompt once and ignores for
     delete globalThis.promptTestSettings.qianqianjie;
     await client.postChatCompletion({ cfg, messages: [{ role: 'user', content: 'task' }] });
     assert.equal(settings.processingPrompt, client.BASE_PROCESSING_PROMPT);
-    assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT }, { role: 'user', content: 'task' }]);
+    assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT + '\n\n' + client.RESPONSE_STYLE_GUIDE }, { role: 'user', content: 'task' }]);
 });
 
 test('empty or whitespace shared prompt uses the common default without restoring either legacy custom prompt', async () => {
@@ -60,13 +61,14 @@ test('empty or whitespace shared prompt uses the common default without restorin
         apiSettings.getSettings();
         assert.equal(settings.processingPrompt, value);
         await client.postChatCompletion({ cfg, messages: [{ role: 'user', content: 'task' }] });
-        assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT }, { role: 'user', content: 'task' }]);
+        assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT + '\n\n' + client.RESPONSE_STYLE_GUIDE }, { role: 'user', content: 'task' }]);
         await client.postChatCompletion({ cfg, messages: [{ role: 'system', content: 'BUSINESS_RULE' }, { role: 'user', content: 'task' }] });
-        assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT + '\n\nBUSINESS_RULE' }, { role: 'user', content: 'task' }]);
+        assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: client.BASE_PROCESSING_PROMPT + '\n\n' + client.RESPONSE_STYLE_GUIDE + '\n\nBUSINESS_RULE' }, { role: 'user', content: 'task' }]);
+        assert.equal(settings.processingPrompt, value);
     }
 });
 
-test('direct, custom, memory and theater requests prepend the current shared prompt once', async () => {
+test('direct, custom, memory and theater requests prepend shared and local expression rules once', async () => {
     apiSettings.setProcessingPrompt('SHARED_RULE {{user}} / {{char}}');
     const messages = [{ role: 'system', content: 'TASK {{char}}' }, { role: 'user', content: 'ask {{user}}' }];
     const callers = [
@@ -81,8 +83,10 @@ test('direct, custom, memory and theater requests prepend the current shared pro
         assert.equal(requests.length, before + 1);
         const sent = requests.at(-1).messages;
         assert.equal(sent.length, 2);
-        assert.equal(sent[0].content, 'SHARED_RULE User / Character\n\nTASK Character');
+        assert.equal(sent[0].content, 'SHARED_RULE User / Character\n\n' + client.RESPONSE_STYLE_GUIDE + '\n\nTASK Character');
         assert.equal(sent[1].content, 'ask User');
+        assert.equal((JSON.stringify(sent).match(/【表达规则】/g) || []).length, 1);
+        assert.equal(settings.processingPrompt, 'SHARED_RULE {{user}} / {{char}}');
         assert.ok(!JSON.stringify(sent).includes('LEGACY_WRITING_RULE'));
         assert.ok(!JSON.stringify(sent).includes('sanctuary_override_directive'));
     }
@@ -90,9 +94,57 @@ test('direct, custom, memory and theater requests prepend the current shared pro
     const parts = [{ type: 'text', text: 'unchanged {{user}}' }];
     await client.postChatCompletion({ cfg, messages: [{ role: 'system', content: 'FIRST' }, { role: 'system', content: 'SECOND' }, { role: 'user', content: parts }] });
     const sent = requests.at(-1).messages;
-    assert.equal(sent[0].content, 'SHARED_RULE User / Character\n\nFIRST');
+    assert.equal(sent[0].content, 'SHARED_RULE User / Character\n\n' + client.RESPONSE_STYLE_GUIDE + '\n\nFIRST');
     assert.equal(sent[1].content, 'SECOND');
     assert.deepEqual(sent[2].content, parts);
+});
+
+test('local expression rules cover advisor and character styles once without changing their source messages', async () => {
+    apiSettings.setProcessingPrompt('STYLE_CUSTOM_RULE');
+    for (const persona of [{}, { personaOverride: '简洁回答' }, { useCharacterPersona: true }]) {
+        const system = buildSpaceChatSystemPrompt({ userName: 'User', charName: 'Character', ...persona });
+        const messages = [{ role: 'system', content: system }, { role: 'user', content: '讨论已有剧情' }];
+        const original = structuredClone(messages), start = requests.length;
+        await client.postChatCompletion({ cfg, messages });
+        const sent = requests.at(-1).messages;
+        assert.equal(requests.length, start + 1);
+        assert.equal(sent[0].content, 'STYLE_CUSTOM_RULE\n\n' + client.RESPONSE_STYLE_GUIDE + '\n\n' + system);
+        assert.equal((JSON.stringify(sent).match(/【表达规则】/g) || []).length, 1);
+        assert.deepEqual(messages, original);
+        assert.equal(settings.processingPrompt, 'STYLE_CUSTOM_RULE');
+    }
+});
+
+test('the first string system gets the prefix while multimodal and later systems stay intact', async () => {
+    apiSettings.setProcessingPrompt('MULTIMODAL_RULE');
+    const parts = [{ type: 'text', text: '原文 {{user}}' }, { type: 'image_url', image_url: { url: 'fixture.png' } }];
+    for (const stringSystems of [[], [{ role: 'system', content: 'FIRST_STRING' }, { role: 'system', content: 'LATER_STRING' }]]) {
+        const messages = [{ role: 'system', content: parts }, ...stringSystems, { role: 'user', content: parts }];
+        const original = structuredClone(messages), start = requests.length;
+        await client.postChatCompletion({ cfg, messages });
+        const sent = requests.at(-1).messages, prefix = 'MULTIMODAL_RULE\n\n' + client.RESPONSE_STYLE_GUIDE;
+        const expected = stringSystems.length
+            ? [{ role: 'system', content: parts }, { role: 'system', content: prefix + '\n\nFIRST_STRING' }, { role: 'system', content: 'LATER_STRING' }, { role: 'user', content: parts }]
+            : [{ role: 'system', content: prefix }, ...original];
+        assert.equal(requests.length, start + 1);
+        assert.deepEqual(sent, expected);
+        assert.equal((JSON.stringify(sent).match(/【表达规则】/g) || []).length, 1);
+        assert.deepEqual(messages, original);
+    }
+});
+
+test('JSON tasks retain machine instructions, quoted expressions and the exact returned structure', async () => {
+    apiSettings.setProcessingPrompt('JSON_RULE');
+    const messages = [{ role: 'system', content: '只返回JSON，缺失值固定为未知。' }, { role: 'user', content: '原文引用：没有证据表明其已离开，不代表他仍在场。' }];
+    const original = structuredClone(messages), start = requests.length;
+    const json = '{"items":[],"missing":"未知","quote":"没有证据表明其已离开，不代表他仍在场"}';
+    completion = json;
+    try {
+        assert.equal(await client.postChatCompletion({ cfg, messages }), json);
+        assert.equal(requests.length, start + 1);
+        assert.deepEqual(requests.at(-1).messages, [{ role: 'system', content: 'JSON_RULE\n\n' + client.RESPONSE_STYLE_GUIDE + '\n\n' + messages[0].content }, messages[1]]);
+        assert.deepEqual(messages, original);
+    } finally { completion = 'fixture reply'; }
 });
 
 test('a requester assembling messages uses the shared setting in effect at its actual dispatch', async () => {
@@ -104,7 +156,8 @@ test('a requester assembling messages uses the shared setting in effect at its a
     updateSharedProcessingPrompt(globalThis.promptTestSettings, 'LATEST_RULE');
     release();
     await pending;
-    assert.equal(requests.at(-1).messages[0].content, 'LATEST_RULE');
+    assert.equal(requests.at(-1).messages[0].content, 'LATEST_RULE\n\n' + client.RESPONSE_STYLE_GUIDE);
+    assert.equal(settings.processingPrompt, 'LATEST_RULE');
 });
 
 const { createTheaterGeneration } = await import('../business/theater/generation.js');
@@ -198,4 +251,75 @@ test('theater generation and regeneration read the current route separately for 
         assert.equal(result.html, '<div class="sp-theater-prose"><p>离线正文</p></div>');
     }
     completion = 'fixture reply';
+});
+
+test('reasoning default request avoids unsupported automatic sampling fields with one dispatch', async t => {
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async (_url, options) => {
+        calls += 1;
+        const body = JSON.parse(options.body);
+        if (['temperature', 'presence_penalty', 'frequency_penalty'].some(key => Object.hasOwn(body, key))) return Response.json({ error: { message: 'Unsupported parameter for reasoning model' } }, { status: 400 });
+        return Response.json({ choices: [{ message: { content: 'ok' } }] });
+    });
+    assert.equal(await client.postChatCompletion({ cfg: { ...cfg, model: 'gpt-6-luna' }, messages: [{ role: 'user', content: 'offline task' }], temperature: 1 }), 'ok');
+    assert.equal(calls, 1);
+});
+
+test('known reasoning families omit automatic sampling without adding output limits across JSON and SSE', async t => {
+    for (const model of ['gpt-5', 'gpt-5.2-mini', 'gpt-6-luna', 'openai/gpt-6-luna', 'o1-preview', 'o3-mini', 'openai/o4-mini', 'gpt-4o-mini', 'private-model', 'gpt-50', 'o10']) {
+        for (const stream of [false, true]) await t.test(`${model}/${stream}`, async () => {
+            const start = requests.length;
+            await client.postChatCompletion({ cfg: { ...cfg, model, stream }, messages: theaterMessages, temperature: 1 });
+            assert.equal(requests.length, start + 1);
+            const body = requests.at(-1), known = !['gpt-4o-mini', 'private-model', 'gpt-50', 'o10'].includes(model);
+            for (const field of ['max_tokens', 'max_completion_tokens']) assert.equal(Object.hasOwn(body, field), false);
+            for (const field of ['temperature', 'presence_penalty', 'frequency_penalty']) assert.equal(Object.hasOwn(body, field), !known);
+            if (!known) assert.deepEqual([body.temperature, body.presence_penalty, body.frequency_penalty], [1, 0, 0]);
+            assert.equal(body.stream, stream);
+        });
+    }
+});
+
+test('excluded advanced parameters stay excluded and explicit reasoning values reach the custom upstream', async t => {
+    const cases = [
+        { name: 'legacy only', additional: { max_tokens: 987 }, expected: { max_tokens: 987 } },
+        { name: 'completion zero', additional: { max_completion_tokens: 0 }, expected: { max_completion_tokens: 0 } },
+        { name: 'legacy null', additional: { max_tokens: null }, expected: { max_tokens: null } },
+        { name: 'both prefer completion', additional: { max_tokens: 987, max_completion_tokens: 654 }, expected: { max_completion_tokens: 654 } },
+        { name: 'exclude completion first', additional: { max_tokens: 987, max_completion_tokens: 654 }, excluded: ['max_completion_tokens'], expected: { max_tokens: 987 } },
+        { name: 'exclude both', additional: { max_tokens: 987, max_completion_tokens: 654 }, excluded: ['max_tokens', 'max_completion_tokens'], expected: {} },
+        { name: 'reasoning none', additional: { reasoning_effort: 'none' }, expected: { temperature: 1 } },
+        { name: 'excluded none', additional: { reasoning_effort: 'none' }, excluded: ['reasoning_effort'], expected: {} },
+        { name: 'explicit temperature zero', additional: { temperature: 0 }, expected: { temperature: 0 } },
+        { name: 'explicit temperature null', additional: { temperature: null }, expected: { temperature: null } },
+        { name: 'explicit penalties', additional: { presence_penalty: 0.4, frequency_penalty: null }, expected: { presence_penalty: 0.4, frequency_penalty: null } },
+        { name: 'explicit zero penalties with none', additional: { reasoning_effort: 'none', presence_penalty: 0, frequency_penalty: 0 }, expected: { temperature: 1, presence_penalty: 0, frequency_penalty: 0 } },
+        { name: 'excluded sampling fields', additional: { reasoning_effort: 'none', temperature: 0, presence_penalty: 0.4, frequency_penalty: 0.5 }, excluded: ['temperature', 'presence_penalty', 'frequency_penalty'], expected: {} },
+    ];
+    const fields = ['max_tokens', 'max_completion_tokens', 'temperature', 'presence_penalty', 'frequency_penalty'];
+    for (const row of cases) for (const stream of [false, true]) await t.test(`${row.name}/${stream}`, async () => {
+        const start = requests.length;
+        await client.postChatCompletion({ cfg: { ...cfg, model: 'gpt-6-luna', stream, spAdditionalParams: JSON.stringify(row.additional), excludeParams: row.excluded ?? [] }, messages: theaterMessages, temperature: 1 });
+        const body = requests.at(-1), additional = JSON.parse(body.custom_include_body ?? '{}'), upstream = { ...body, ...additional };
+        assert.equal(requests.length, start + 1);
+        assert.deepEqual(Object.fromEntries(fields.filter(key => Object.hasOwn(upstream, key)).map(key => [key, upstream[key]])), row.expected);
+        for (const key of row.excluded ?? []) { assert.equal(Object.hasOwn(body, key), false); assert.equal(Object.hasOwn(additional, key), false); }
+        if (Object.keys(additional).length) assert.equal(body.chat_completion_source, 'custom');
+    });
+});
+
+test('content utility and theater use their current models through the same reasoning compatibility', async () => {
+    resetRoutes(); settings.apiModel = 'gpt-6-luna'; settings.apiAdditionalParams = '';
+    settings.utilityPresetId = apiSettings.upsertApiPreset('机械', { ...cfg, model: 'openai/gpt-5.2', stream: true });
+    settings.theaterPresetId = apiSettings.upsertApiPreset('剧场', { ...cfg, model: 'o3-mini', spAdditionalParams: '{"temperature":0}' });
+    const start = requests.length;
+    await client.callCustomApi(globalThis.promptTestContext, 'offline task', apiSettings.loadCfg());
+    await client.callMemoryApi(theaterMessages);
+    await client.callTheaterApi(theaterMessages);
+    const sent = requests.slice(start);
+    assert.equal(sent.length, 3);
+    assert.deepEqual(sent.map(body => body.model), ['gpt-6-luna', 'openai/gpt-5.2', 'o3-mini']);
+    assert.equal(sent[1].stream, true);
+    assert.equal(Object.hasOwn(sent[0], 'temperature'), false); assert.equal(Object.hasOwn(sent[1], 'temperature'), false);
+    assert.equal(JSON.parse(sent[2].custom_include_body).temperature, 0);
 });
