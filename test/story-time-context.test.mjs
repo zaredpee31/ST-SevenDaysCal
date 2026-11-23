@@ -11,6 +11,7 @@ import { createLinesGenerationController } from '../business/lines/controller.js
 import { createTaskOwnerManager } from '../runtime/task-owner.js';
 import { drawTickets } from '../business/lines/vectors/draw.js';
 import { buildLinesPrompt } from '../business/lines/prompt.js';
+import { buildGenerationMemoryQuery } from '../runtime/generation-context.js';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = fs.readFileSync(path.join(repo, 'index.js'), 'utf8');
@@ -74,6 +75,11 @@ test('unconfirmed structured fields display without machine keys and custom fall
     assert.match(fallback.todayHtml, /霜月8日 周二/);
     assert.doesNotMatch(fallback.todayHtml, /周六|太初历|date=|weekday=|time=/);
     assert.equal(fallback.timeHtml, '');
+    const withoutWeekday = formatHead({ anchor: { month: 4, day: 8 } });
+    assert.equal(withoutWeekday.todayHtml, '<span class="sp-dash-sum-today">4月8日</span>');
+    const datedClock = formatHead({ anchor: { month: 4, day: 8 }, clockMeta: { valid: true, month: 4, day: 8, time: '20:25' } });
+    assert.equal(datedClock.todayHtml, '<span class="sp-dash-sum-today">4月8日</span>');
+    assert.match(datedClock.timeHtml, />20:25</);
     assert.equal(formatMeta({ ...meta, structured: false, raw: '谷雨亥时' }), '谷雨亥时', '旧非结构化原文仍保留');
 });
 
@@ -125,6 +131,7 @@ function buildHarness(ctx) {
     });
     const formatStoryClockMeta = productionStoryClockFormatter();
     const build = vm.runInNewContext(`${region}\nbuildMessages`, {
+        buildGenerationMemoryQuery,
         buildGenerationHistoryContext: (_context, historyLimit) => ({ history: Number(historyLimit) > 0 ? [{ role: 'assistant', content: '已清洗正文；无时间戳标签' }] : [], excludeMesIds: [] }),
         buildWorldInfoContext: async () => '',
         readCardExtras: () => ({ personaDesc: '', authorNote: '' }),

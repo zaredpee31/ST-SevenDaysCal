@@ -90,6 +90,11 @@ function moduleHasContent(id, value) {
     });
 }
 
+function stripSpaceNoteLinks(value) {
+    for (const message of normalizeSpaceHistory(value)) delete message.coordinateNote;
+    return value;
+}
+
 function moduleFromRoots(id, roots = {}) {
     if (id === 'theater') {
         const root = isObject(roots['sp-theater']) ? roots['sp-theater'] : null;
@@ -97,7 +102,11 @@ function moduleFromRoots(id, roots = {}) {
     }
     const data = isObject(roots['sp-store']?.data) ? roots['sp-store'].data : {};
     const entries = {};
-    for (const [key, value] of Object.entries(data)) if (KEY_MATCHERS[id]?.(key)) entries[key] = clone(decodeStoreEntry(key, value));
+    for (const [key, value] of Object.entries(data)) {
+        if (!KEY_MATCHERS[id]?.(key)) continue;
+        const entry = clone(decodeStoreEntry(key, value));
+        entries[key] = id === 'space' ? stripSpaceNoteLinks(entry) : entry;
+    }
     return { entries };
 }
 
@@ -140,7 +149,8 @@ function validateModule(id, value) {
         if (id === 'space') {
             if (!Array.isArray(item) && !(isObject(item) && item.version === 1 && Array.isArray(item.messages)
                 && Array.isArray(item.pages) && item.pages.length >= 1 && item.pages.length <= 2
-                && item.pages[0] === '1' && (item.pages.length === 1 || item.pages[1] === '2'))) return fail('invalid-entry', '间的对话结构不正确');
+                && item.pages.every(page => page === '1' || page === '2')
+                && new Set(item.pages).size === item.pages.length)) return fail('invalid-entry', '间的对话结构不正确');
             entries[key] = clone(item); continue;
         }
         const expectsArray = ARRAY_ENTRY_KEYS[id]?.(key) === true;
@@ -177,7 +187,7 @@ export function parsePortableChatPackage(text, { maxBytes = PORTABLE_CHAT_MAX_BY
 }
 
 export function markImportedSpaceHistory(value) {
-    const messages = clone(Array.isArray(value) ? value : value?.messages || []).map(message => {
+    const messages = stripSpaceNoteLinks(clone(Array.isArray(value) ? value : value?.messages || [])).map(message => {
         if (message?.role !== 'assistant' || (!SPACE_WIDGET_RX.test(String(message.content || ''))
             && !(message.expectedWidgetKind === 'outline_widget' && normalizeOutlineResponse(message.content)))) return message;
         return { ...message, portableReadonly: true };

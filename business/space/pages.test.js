@@ -82,6 +82,22 @@ test('页内回指请求交给同次模型理解，并保留完整候选历史',
     assert.deepEqual(intent.allowedWidgetKinds, ['schedule_widget', 'line_widget', 'almanac_widget', 'era_widget', 'outline_widget']);
 });
 
+test('portable Space histories omit links to favorites owned by the original chat', () => {
+    const message = { role: 'user', content: '设定', coordinateNote: { id: 'space-note', chatId: 'original' } };
+    const value = { version: 1, pages: ['1'], messages: [message] };
+    const exported = buildPortableChatPackage({
+        selectedModules: ['space'],
+        roots: { 'sp-store': { version: 1, data: { 'space-chat-user': value } } },
+    });
+    assert.equal(exported.ok, true);
+    const portableValue = exported.package.modules.space.entries['space-chat-user'];
+    assert.deepEqual(portableValue.messages, [{ role: 'user', content: '设定' }]);
+    assert.equal(message.coordinateNote.id, 'space-note');
+    portableValue.messages[0].coordinateNote = message.coordinateNote;
+    const plan = createPortableImportPlan({ portablePackage: exported.package, selectedModules: ['space'], targetChatId: 'copy' });
+    assert.equal(plan.replacementRoots['sp-store'].data['space-chat-user'].messages[0].coordinateNote, undefined);
+});
+
 test('导入替换及数据管理清除后重置临时页草稿，不把窗口2草稿带到窗口1', async () => {
     const { createSpaceFeature } = await import('./feature.js');
     let saved = { version: 1, pages: ['1', '2'], messages: [] };
@@ -101,4 +117,44 @@ test('导入替换及数据管理清除后重置临时页草稿，不把窗口2�
     feature.ui.switchPage('2'); input.val('另一份窗口2草稿'); feature.refreshAfterStoreClear('space-chat');
     assert.equal(feature.ui.activePageId(), '1'); assert.equal(input.val(), '');
     assert.deepEqual(feature.repository.pages(), ['1']);
+});
+
+test('关闭任意窗口只删除该页记录，保留另一页编号且最后一页不能关闭', async () => {
+    for (const closing of ['1', '2']) {
+        const remaining = closing === '1' ? '2' : '1';
+        const f = fixture({ version: 1, pages: ['1', '2'], messages: [
+            { role: 'user', content: '旧窗口1记录' },
+            { role: 'assistant', content: '窗口2记录', pageId: '2' },
+        ] });
+        assert.equal(f.repo.removePage(closing), true);
+        assert.deepEqual(f.repo.pages(), [remaining]);
+        assert.equal(f.repo.history().length, 1);
+        assert.equal(f.repo.history()[0].content, remaining === '1' ? '旧窗口1记录' : '窗口2记录');
+        assert.equal(f.repo.removePage(remaining), false);
+        assert.equal(f.repo.removePage('3'), false);
+        assert.equal(f.writes.length, 1);
+        assert.deepEqual(fixture(f.stored()).repo.pages(), [remaining]);
+        const context = createSpaceContext({ context: () => ({}) });
+        const messages = await context.buildMessages({ target, userMsg: '继续讨论', historySnapshot: f.repo.history(), pageId: remaining, pages: f.repo.pages() });
+        const background = messages.slice(1, -1).map(message => message.content).join('\n');
+        assert.match(background, remaining === '1' ? /旧窗口1记录/ : /窗口2记录/);
+        assert.doesNotMatch(background, closing === '1' ? /旧窗口1记录/ : /窗口2记录/);
+        assert.equal(f.repo.addPage(), closing);
+        assert.deepEqual(f.repo.pages(), ['1', '2']);
+        assert.equal(f.repo.history().length, 1, '重新新增的窗口为空，不恢复已删除内容');
+    }
+});
+
+test('只剩窗口2时，空页与有记录的存档都能导出导入并保持原编号', () => {
+    for (const messages of [[], [{ role: 'user', content: '保留窗口2', pageId: '2' }]]) {
+        const value = { version: 1, pages: ['2'], messages };
+        const exported = buildPortableChatPackage({ selectedModules: ['space'], roots: { 'sp-store': { version: 1, data: { 'space-chat-user': value } } } });
+        assert.equal(exported.ok, true);
+        const parsed = parsePortableChatPackage(JSON.stringify(exported.package));
+        assert.equal(parsed.ok, true);
+        const plan = createPortableImportPlan({ portablePackage: parsed.package, selectedModules: ['space'], targetChatId: 'next' });
+        const imported = plan.replacementRoots['sp-store'].data['space-chat-user'];
+        assert.deepEqual(imported.pages, ['2']);
+        assert.deepEqual(fixture(imported).repo.pages(), ['2']);
+    }
 });

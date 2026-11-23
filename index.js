@@ -1,4 +1,5 @@
 import { readPanelViewport, syncDialogViewport, bindOutsideClose, fitDesktopPanel } from './ui/panel-window.js';
+import { bindWindowDiagnosticControls } from './ui/window-diagnostics.js';
 import { primaryTextColor, syncUiTheme } from './utils/ui-theme.js';
 import { icon, setIcon } from './utils/icons.js';
 import { getContext, extension_settings, extensionNames, extensionTypes } from '../../../extensions.js';
@@ -14,10 +15,11 @@ import { createPanelFailureStore, createPanelFailureRecency, UI_REFRESH_FAILURE_
 import { createCoordinateRuntime } from './business/coordinate/runtime.js';
 import { enterCoordinateSidebar } from './business/coordinate/ui.js';
 import { captureSnapshotElement } from './business/coordinate/capture.js';
+import { SPACE_NOTE_KIND } from './business/coordinate/schema.js';
 import * as store from './store.js';
 import { bindStoreViewFallback, keyDesc, readStore, writeStore, writeStoreConfirmed, removeStore } from './store.js';
 import * as ledger from './business/ledger/repository.js';
-import { normalizeLedgerInterval } from './business/ledger/settings.js';
+import { ledgerGenerationBlock, normalizeLedgerInterval } from './business/ledger/settings.js';
 import * as theaterDeviceCache from './runtime/theater-device-cache.js';
 import { createTheaterHostPorts } from './runtime/theater-host-ports.js';
 import { createUserNameMask } from './ui/user-name-mask.js';
@@ -153,7 +155,7 @@ import { createAxisTransactionController } from './business/axis/transaction.js'
 import { createAxisPromptBuilder } from './business/axis/prompts.js';
 import { createAxisDateContext } from './business/axis/date-context.js';
 import { createPhoneCalendarApi, createPhoneCalendarSource } from './business/axis/phone.js';
-import { resolveAlmanacContextText, sanitizeGenerationContextText } from './runtime/generation-context.js';
+import { buildGenerationMemoryQuery, resolveAlmanacContextText, sanitizeGenerationContextText } from './runtime/generation-context.js';
 import { bindStoryClock, parseStoryClock as parseStoryClockPure, parseJudgedDate as parseJudgedDatePure, latestStoryClock as latestStoryClockPure, storyClockDate as storyClockDatePure, storyWeekdayRef as storyWeekdayRefPure, completeStoryClock as completeStoryClockPure, storyClockNarrativeBody, buildStoryClockPrompt, createStoryClockController, extensionStoryClockState } from './business/axis/story-clock.js';
 import { createWeekdayConsumerContext } from './business/axis/weekday-coordinator.js';
 import { buildDateJudgePrompt as buildDateJudgePromptPure } from './business/axis/date-detection.js';
@@ -235,6 +237,11 @@ import {
 // 坐标与楼内框各自持有唯一 runtime 句柄。
 let coordinateRuntime = null;
 let inlineFeature = null;
+const pendingInlineRootBindings = [];
+function registerInlineRootBinding(key, binder) {
+    if (inlineFeature?.bindRoots) inlineFeature.bindRoots(key, binder);
+    else pendingInlineRootBindings.push({ key, binder });
+}
 
 function refreshInlineWindow(immediate = false) { return inlineFeature?.refresh?.(immediate); }
 function _clearAllInlineBoxes() { return inlineFeature?.clear?.(); }
@@ -801,9 +808,11 @@ async function runLedgerCaptureWithFeedback(manual, travelContext) {
     }
     return result;
 }
-const runLedgerCaptureStep = (manual = false, travelContext = null) => pluginEnabled()
-    ? runLedgerCaptureWithFeedback(manual, travelContext)
-    : Promise.resolve({ status: 'skipped', reason: 'plugin-disabled' });
+const runLedgerCaptureStep = (manual = false, travelContext = null) => runLedgerStep(runLedgerCaptureWithFeedback, manual, travelContext);
+async function runLedgerStep(run, manual, travelContext) {
+    if (!pluginEnabled()) return { status: 'skipped', reason: 'plugin-disabled' };
+    return ledgerGenerationBlock(getSettings(), showToast, manual, travelContext) || run(manual, travelContext);
+}
 const ledgerInjectionController = createLedgerInjectionController({
     context: getContext,
     enabled: injectEnabled,
@@ -872,9 +881,7 @@ async function runLedgerJudgeWithFeedback(manual, travelContext) {
     }
     return result;
 }
-const runLedgerJudgeStep = (manual = false, travelContext = null) => pluginEnabled()
-    ? runLedgerJudgeWithFeedback(manual, travelContext)
-    : Promise.resolve({ status: 'skipped', reason: 'plugin-disabled' });
+const runLedgerJudgeStep = (manual = false, travelContext = null) => runLedgerStep(runLedgerJudgeWithFeedback, manual, travelContext);
 const ledgerInlineRenderer = createLedgerInlineRenderer({
     settings: getSettings,
     calendar: loadCalDesc,
@@ -1363,7 +1370,7 @@ function collectTimeTravelContext(sourceDate, targetDate) {
     const injectionState = {
         linesInjected: injectionOn && settings.linesEnabled !== false && settings.linesInject === true && lines.length > 0,
         outlineInjected: outline.length > 0,
-        ledgerInjected: injectionOn && settings.ledgerInject === true && ledgerInjectionController.echo.length > 0,
+        ledgerInjected: injectionOn && settings.ledgerCaptureEnabled === true && settings.ledgerInject === true && ledgerInjectionController.echo.length > 0,
     };
     return { sourceDate, targetDate, calendar, anniversaries, targetWeekday, outline, outlineCursor, lines, injectionState };
 }
@@ -1603,7 +1610,7 @@ const MODULE_INTROS = {
         _iSub('刻度') +
         _iText('“标注”从正文提取时间账，“更新”刷新现状；依据前一条 AI 正文，最新回复在下一条出现后纳入。') +
         _iText('编辑保存后自动锁定；锁定项不受 AI 更新。“暂停埋入”只停注入；“了结”移入归档，可捞回或彻底删除。') +
-        _iText('刻度自动任务默认关闭；在推进设置开启“刻度”后按标注／更新间隔运行，0 分别关闭。潜伏注入需总开关和刻度开关。') +
+        _iText('在功能与内容开关开启「刻度」后，可手动标注和更新，再按推进设置的间隔运行自动任务。间隔为 0 时只手动执行对应任务。潜伏注入还需开启注入总闸与刻度注入。') +
         _iText('「间」可追加轴日期或应用整套历法；旧日期的编辑、删除及刻度操作在轴页完成。'),
     lines:
         _iLede('「线」追踪平行事件与冷知识。平行事件首次最多八条，后续按剧情自然增减。') +
@@ -1611,8 +1618,8 @@ const MODULE_INTROS = {
         _iKey('player-track-next', '推进', '更新已有线，也可能新增或结束事件') +
         _iKey('history', '历史版本', '预览并恢复最近十份旧版；恢复前的当前版也会保留') +
         _iKey('dots-vertical', '事件菜单', '编辑、锁定、注入或删除单条线；注入先填入输入框') +
-        _iText('推进可按回合、日期或手动进行，在推进设置中选择。潜伏注入需同时开启总开关和线开关。') +
-        _iText('冷知识开关控制随线自动生成和楼内显示，手动面板始终可用。新增或修改事件线也可去「间」讨论后应用。'),
+        _iText('生成与推进需要开启「线」。推进可按回合、日期或手动进行，在推进设置中选择。潜伏注入还需开启注入总闸与线注入。') +
+        _iText('开启「冷知识」后可在面板新增、在楼层换一条，也可随线自动生成。已有冷知识可在面板查看。新增或修改事件线也可去「间」讨论后应用。'),
     outline:
         _iLede('「面」管理正式剧情大纲与当前节点。重新生成会替换整份大纲；「间」里的草稿需点击应用才替换，并从第一节点开始。') +
         _iKey('box', '去间讨论', '切到间并预填讨论开头，仍需手动发送') +
@@ -2017,7 +2024,8 @@ const spaceFeature = createSpaceFeature({
                 });
             } catch { return '【刻度读取失败】本轮暂时无法读取这项资料。'; }
         },
-        readWorldInfo: (ctx, triggerText, referenceHistory, titleSupplementText = '') => buildWorldInfoContext(ctx, triggerText === undefined ? undefined : { triggerText, triggerMode: 'query', referenceHistory, titleSupplementText }),
+        readWorldInfo: (ctx, triggerText, referenceHistory, titleSupplementText = '', { includeTitleDirectory = false } = {}) =>
+            buildWorldInfoContext(ctx, { triggerText, triggerMode: 'query', referenceHistory, titleSupplementText, includeTitleDirectory }),
         readMemory: (ctx, query) => getMemText({ query, excludeMesIds: getRecentVisibleFloorIds(ctx, 6) }),
         readRecent: ctx => buildRecentChatContext(ctx, 6, Infinity),
         readCardExtras,
@@ -2082,9 +2090,9 @@ const spaceFeature = createSpaceFeature({
             let scoped;
             try {
                 const items = await repo.getAllItems();
-                scoped = items.filter(item => chatHash != null
+                scoped = items.filter(item => item.kind !== SPACE_NOTE_KIND && (chatHash != null
                     ? String(item.chatIdHash ?? '') === String(chatHash) || (item.chatIdHash == null && chatId && String(item.chatId ?? '') === chatId)
-                    : item.chatIdHash == null && chatId && String(item.chatId ?? '') === chatId);
+                    : item.chatIdHash == null && chatId && String(item.chatId ?? '') === chatId));
             } catch { return '【坐标读取失败】本轮暂时无法读取这项资料。'; }
             const rows = scoped.map(item => `- 楼层 ${item.floorIndex ?? item.messageId ?? '?'}：${item.textPreview || '（无摘要）'}${item.tags?.length ? `｜标签 ${item.tags.join('、')}` : ''}`);
             const selected = selectCoordinateReference(message, scoped);
@@ -2106,7 +2114,7 @@ const spaceFeature = createSpaceFeature({
     renderEnv: {
         escapeHtml,
         getUserName: () => getContext().name1 || '用户',
-        formatAi: text => renderAiMessageHtml(text, { FORBID_TAGS: ['button', 'input', 'textarea', 'select', 'option', 'form', 'iframe', 'object', 'embed'] }),
+        formatAi: renderSpaceReplyHtml,
         parseAlmanac: parseAlmanacWidget,
         parseEra: parseEraWidget,
         loadCalendar: loadCalDesc,
@@ -2123,6 +2131,8 @@ const spaceFeature = createSpaceFeature({
         setFailureHtml: html => $in('#sp-space-failure-slot').html(html),
         autoGrow: autoGrowTextarea,
         copyText: copyPlainText,
+        saveSpaceNote: note => coordinateRuntime?.feature?.saveSpaceNote(note),
+        hasSpaceNote: (id, chatId) => coordinateRuntime?.repository?.hasSpaceNote(id, chatId),
         confirm: spConfirm,
         toast: (message, error) => showToast(message, null, error),
         closeActionMenus,
@@ -2143,6 +2153,7 @@ const _injectIdsByText  = new Map();
 let   _injectIdSeq      = 0;
 let viewportSyncBound   = false;
 let viewportSyncFrame = null;
+let windowDiagnostics = null;
 
 const isMobile = () => window.innerWidth <= 640;
 
@@ -2319,6 +2330,7 @@ jQuery(async () => {
             sheet: () => _spShadow?.querySelector?.('.sp-sheet') || document.querySelector('.sp-sheet'),
             chatName: () => { const el = document.querySelector('#selected_chat_pole, #chat_name_pole, .current_chat_name'); return el?.value || el?.textContent?.trim() || getContext().chatId || '当前聊天'; },
             capture: el => captureSnapshotElement(el, { documentRef: document, DOMPurify: globalThis.DOMPurify }),
+            formatSpaceReply: text => renderSpaceReplyHtml(text, { ADD_TAGS: [], FORBID_ATTR: ['class', 'id', 'style'], ALLOW_DATA_ATTR: false }),
             toast: (message, action, error) => showToast(message, action, error),
             saveChatDebounced: () => { prepareNormalChatStoreForSave(getContext()); return scriptCore.saveChatDebounced(); },
             warn: (message, error) => console.warn(message, error),
@@ -2381,6 +2393,7 @@ jQuery(async () => {
         ledgerLastJudgedMsgId = lastSeen;
         ledgerJudgeCounter = 0;
         ledgerRegeneratedMsgId = -1;
+        ledgerRegenerationDeleted = false;
         currentView = 'user';
         charViewName = null;
         outlineMode = false;
@@ -2500,7 +2513,7 @@ jQuery(async () => {
         // 轴日历块：独立于线主开关，刷新当前渲染窗口（最新 AI 楼读活态，历史楼读快照；只读，无生成）
         syncLatestAlmanacBlock();
         syncLatestScheduleBlock();   // 点·日程条：同上，随新楼补挂（只读）
-        // Master switch: linesEnabled=false disables auto-advance + inline block
+        // 线功能关时跳过自动推进与线的楼内处理。
         if (getSettings().linesEnabled === false) return;
         const mid = Number(messageId);
         const autoSuppressed = isAutomationSuppressed(mid, AUTOMATION_MODULES.LINES);
@@ -2560,7 +2573,7 @@ jQuery(async () => {
         refreshStoryClockInjection();
         linesFeature.onGenerationStarted({ genType, dryRun });
         if (dryRun || genType === 'quiet') return;
-        finishLedgerRegeneration();
+        finishLedgerRegeneration(true);
         const chat = getContext().chat;
         const last = Array.isArray(chat) ? chat.length - 1 : -1;
         if (genType === 'regenerate' && ledgerNarrativeMessage(chat?.[last])) {
@@ -2677,11 +2690,12 @@ jQuery(async () => {
     };
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.ledgerJudge);
     // 暗历·注入重算（场景感知）：每出一楼就按最新正文重挑注入集——纯 JS 打分、零 API，故不设间隔/单调闸，
-    // 让选择跟着场景走（正文提到谁/什么标签，那条就浮上来）。仅 ledgerInject 开时干活（refresh 内部再兜一层门控）。
+    // 让选择跟着场景走（正文提到谁/什么标签，那条就浮上来）。刻度和刻度注入均开启时重算。
     if (_stListeners.ledgerInjectRescore) eventSource.removeListener?.(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.ledgerInjectRescore);
     _stListeners.ledgerInjectRescore = async (messageId) => {
         if (!pluginEnabled()) return;
-        if (getSettings().ledgerInject !== true) return;
+        const settings = getSettings();
+        if (settings.ledgerCaptureEnabled !== true || settings.ledgerInject !== true) return;
         const chat = getContext().chat;
         if (!Array.isArray(chat) || messageId !== chat.length - 1) return;   // 只跟最新楼，别为改旧楼空转
         // 先重挑注入集（更新 ledger injection controller echo），再刷窗——本监听器在 char 之后触发，char 那趟冻的是
@@ -2958,6 +2972,7 @@ inlineFeature = createInlineFeature({
     getLinesCacheKey, parseLines, linesFeature, snapshot, keyDesc, createWeekdayConsumerContext,
     storyWeekdayRefPure, ALM_CHAT_SCAN_LIMIT, pointInlineRenderer, axisInlineRenderer, $, _buildLedgerBlockHtml,
     buildUserRecall: _buildUserRecallBoxHtml,
+    stylesheetUrl: STYLESHEET_URL,
     pluginEnabled, documentRef: document, windowRef: window,
     freezeSnapshot: freezeSnapshotToFloor,
     readSnapshot: id => snapshot.readSnapshot(id),
@@ -2969,17 +2984,20 @@ inlineFeature = createInlineFeature({
     chatMessage: floor => getContext()?.chat?.[floor]?.mes || '', parseStoryClock: (message, calendar) => parseStoryClockPure(message, calendar),
     coordinateChanged: input => coordinateRuntime?.feature?.onChatDomChanged?.(input),
     isStreaming: () => linesFeature.isStreaming(),
-    syncTheme: (_doc, box) => {
+    syncTheme: (root, box) => {
         const theme = detectSTTheme();
+        if (root?.host) syncUiTheme(root.host, theme);
         syncUiTheme(box, theme);
-        syncVectorGlyphTheme(document, theme);
+        syncVectorGlyphTheme(root || box, theme);
+        if (root?.host) refreshUserNameMask(root.host);
     },
 });
+for (const { key, binder } of pendingInlineRootBindings.splice(0)) inlineFeature.bindRoots?.(key, binder);
 if (document.querySelector('#chat')) inlineFeature.init();
 // ─── 线·伏笔潜伏注入（隐形注入主楼 AI）────────────────────────────────────────
 // 把当前视角的活跃线（跳过终态 stage）以 SYSTEM 角色注入聊天上下文（IN_CHAT + depth），
 // 让主楼 AI「心里有数」、把伏笔当暗流自然呈现；聊天记录里不显示。默认关（opt-in）——
-// 改 AI 行为且增加 token。刷新时机跟内联块同步（见 sync/backfill + 开关 handler）。
+// 改 AI 行为且增加 token。生成前从当前存档补回酒馆重建聊天时清掉的注入。
 const LINES_INJECT_KEY   = 'sp_lines_latent';
 // 重设潜伏注入。读当前视角活跃线；关闭或无活跃线时清空。幂等，可随处多调。
 function refreshLinesInjection() {
@@ -3001,6 +3019,7 @@ let   ledgerAutomationEpoch  = 0;
 let   ledgerCaptureQueued    = false;
 let   ledgerJudgeQueued      = false;
 let   ledgerRegeneratedMsgId = -1;
+let   ledgerRegenerationDeleted = false;
 function enqueueLedgerAutomation(task) {
     const epoch = ledgerAutomationEpoch;
     const queued = ledgerAutomationQueue.catch(() => {}).then(() => epoch === ledgerAutomationEpoch ? task() : { status: 'cancelled', reason: 'superseded' });
@@ -3015,8 +3034,10 @@ function invalidateLedgerAutomationQueue() {
 }
 function rewindLedgerAutomationAfterDeletion(messageId) {
     const replacingLastAi = ledgerRegeneratedMsgId >= 0 && messageId === ledgerRegeneratedMsgId && getContext().chat?.length === ledgerRegeneratedMsgId;
-    if (!replacingLastAi) {
+    if (replacingLastAi) ledgerRegenerationDeleted = true;
+    else {
         ledgerRegeneratedMsgId = -1;
+        ledgerRegenerationDeleted = false;
         const latest = ledgerLatestAiFloorId();
         ledgerLastCapturedMsgId = Math.min(ledgerLastCapturedMsgId, latest - 1);
         ledgerLastJudgedMsgId = Math.min(ledgerLastJudgedMsgId, latest - 1);
@@ -3025,11 +3046,16 @@ function rewindLedgerAutomationAfterDeletion(messageId) {
     }
     invalidateLedgerAutomationQueue();
 }
-function finishLedgerRegeneration() {
+function finishLedgerRegeneration(nextGeneration = false) {
     const floor = ledgerRegeneratedMsgId;
+    if (floor < 0) return;
+    const hasReplacement = ledgerNarrativeMessage(getContext().chat?.[floor]);
+    // 结束/停止通知可能早于删楼或替代正文落地；缺失是否已成定局，留到下一次真正生成时确认。
+    if (!nextGeneration && (!ledgerRegenerationDeleted || !hasReplacement)) return;
     ledgerRegeneratedMsgId = -1;
+    ledgerRegenerationDeleted = false;
     // 旧 AI 已删除、替代回复尚未落地就中止时，下一条回复仍应按新楼计数。
-    if (floor >= 0 && !ledgerNarrativeMessage(getContext().chat?.[floor])) rewindLedgerAutomationAfterDeletion();
+    if (!hasReplacement) rewindLedgerAutomationAfterDeletion();
 }
 
 // 历·API 兜底判定的间隔（缺省/非法 → 3；≥1）。抄 getOutlineJudgeInterval。
@@ -3174,17 +3200,28 @@ function initChatObserver() {
 
 function injectExtButton() {
     // 侧栏入口由魔杖或悬浮按钮打开。
+    const contentHtml = `
+        <div class="extensionsMenuExtensionButton sp-menu-icon" title="打开构画">${PEN_MENU_ICON_SVG}</div>
+        <span>构画</span>`;
     const wandHtml = `
         <div id="sp_open_wand" class="list-group-item flex-container flexGap5" style="display:flex;flex-direction:row;flex-wrap:nowrap;align-items:center;white-space:nowrap">
-            <div class="extensionsMenuExtensionButton sp-menu-icon" title="打开构画">${PEN_MENU_ICON_SVG}</div>
-            <span>构画</span>
+            ${contentHtml}
         </div>`;
 
     function mountWandBtn() {
+        if (document.getElementById('sp_open_wand')) return true;
         const c = document.getElementById('sp_wand_container') || document.getElementById('extensionsMenu');
-        if (!c || document.getElementById('sp_open_wand')) return false;
+        if (!c) return false;
         c.insertAdjacentHTML('beforeend', wandHtml);
-        document.getElementById('sp_open_wand')?.addEventListener('click', () => openSchedule());
+        const entry = document.getElementById('sp_open_wand');
+        // 保留 Light DOM 内容供酒馆识别名称与键盘入口；不设 slot，实际绘制只使用根内内容。
+        const shadow = entry.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `<style>
+            .sp-menu-icon { width:20px;height:20px;flex:0 0 20px;display:flex;align-items:center;justify-content:center;align-self:center;pointer-events:none; }
+            .sp-menu-pen-icon { width:18px;height:18px;display:block; }
+            span { font:inherit;color:inherit; }
+        </style>${contentHtml}`;
+        entry.addEventListener('click', () => openSchedule());
         return true;
     }
     if (!mountWandBtn()) {
@@ -3230,7 +3267,9 @@ function injectFab() {
     document.documentElement.insertAdjacentHTML('beforeend', html);
     const fab = document.getElementById(FAB_ID);
     const shadow = fab.attachShadow({ mode: 'open' });
-    shadow.innerHTML = `<link rel="stylesheet" href="${STYLESHEET_URL}">
+    // The later stylesheet supplies display:flex once the complete FAB style is ready.
+    shadow.innerHTML = `<style>.sp-fab-btn { display: none; }</style>
+        <link rel="stylesheet" href="${STYLESHEET_URL}">
         <button class="sp-fab-btn sp-${currentTheme}" title="构画"
             style="transform:translateZ(0);clip:auto;">
             ${PEN_ICON_SVG}
@@ -3814,6 +3853,7 @@ function injectModal() {
                                                 <input id="sp-dashed-keep-count" class="sp-input sp-interval-input" type="number" min="2" step="1" value="${escapeAttr(String(linesFeature.dashed.normalizeKeepCount(getSettings().dashedKeepCount)))}" ${getSettings().dashedCleanupEnabled !== false ? '' : 'disabled'} aria-label="保留最近多少条未锁冷知识">
                                             </div>
                                             <label class="sp-mode-opt"><input type="checkbox" id="sp-ledger-capture-enabled" ${getSettings().ledgerCaptureEnabled === true ? 'checked' : ''}><span>刻度</span></label>
+                                            <p class="sp-cfg-hint">线控制手动生成和推进、自动推进与潜伏注入。冷知识控制手动生成、随线生成与楼内显示。刻度控制手动和自动标注、更新与潜伏注入。</p>
                                         </div>
                                     </details>
 
@@ -3877,7 +3917,7 @@ function injectModal() {
                                         <div class="sp-settings-section-body">
                                             <label class="sp-mode-opt"><span>每</span><input id="sp-ledger-capture-interval" class="sp-input sp-interval-input" type="number" min="0" max="30" value="${escapeAttr(String(getLedgerCaptureInterval()))}"><span>条 AI 回复标注一次</span></label>
                                             <label class="sp-mode-opt"><span>每</span><input id="sp-ledger-judge-interval" class="sp-input sp-interval-input" type="number" min="0" max="30" value="${escapeAttr(String(getLedgerJudgeInterval()))}"><span>条 AI 回复更新一次现状</span></label>
-                                            <p class="sp-cfg-hint">间隔设为 0 可关闭对应自动任务；手动标注和更新仍可使用。默认每 5 条自动标注、每 4 条自动更新现状。依据前一条 AI 正文标注和更新，最新回复在下一条 AI 出现后纳入。</p>
+                                            <p class="sp-cfg-hint">刻度开启时，间隔设为 0 只关闭对应自动任务，仍可手动标注或更新。默认每 5 条自动标注、每 4 条自动更新现状。依据前一条 AI 正文标注和更新，最新回复在下一条 AI 出现后纳入。</p>
                                             <p class="sp-cfg-group">首次历史溯源范围</p>
                                             <label class="sp-mode-opt"><input type="radio" name="sp-ledger-history-scope" value="recent" ${getSettings().ledgerHistoryScope !== 'all' && getSettings().ledgerHistoryScope !== 'custom' ? 'checked' : ''}><span>最近</span><input id="sp-ledger-history-limit" class="sp-input sp-interval-input" type="number" min="1" max="500" value="${escapeAttr(String(Math.max(1, Math.min(500, Number(getSettings().ledgerHistoryLimit) || 50))))}"><span>个有效历史角色回复（默认）</span></label>
                                             <label class="sp-mode-opt"><input type="radio" name="sp-ledger-history-scope" value="all" ${getSettings().ledgerHistoryScope === 'all' ? 'checked' : ''}><span>全部有效历史角色回复</span></label>
@@ -3925,7 +3965,7 @@ function injectModal() {
                                         <summary class="sp-settings-section-title">诊断管理</summary>
                                         <div class="sp-settings-section-body">
                                             <div class="sp-diagnostics-block">
-                                                <label class="sp-cfg-group">AI 输入</label>
+                                                <div class="sp-cfg-group">AI 输入</div>
                                                 <p class="sp-cfg-hint"><strong>仅供本人排查。</strong>这里是最近一次实际发给 AI 的完整输入，可能包含最近聊天、上下文、世界书和提示词等敏感内容，不建议公开分享。</p>
                                                 <details class="sp-diagnostics-preview sp-diagnostics-preview-empty" id="sp-diagnostics-ai-input-preview">
                                                     <summary class="sp-diagnostics-preview-title">查看最近 AI 输入</summary>
@@ -3937,14 +3977,25 @@ function injectModal() {
                                             </div>
                                             <hr class="sp-mem-divider">
                                             <div class="sp-diagnostics-block">
-                                                <label class="sp-cfg-group">请求诊断</label>
+                                                <div class="sp-cfg-group">请求诊断</div>
                                                 <p class="sp-cfg-hint"><strong>适合发给开发者。</strong>复制最近 30 条安全诊断日志；不含正文、提示词、API Key 或 URL。</p>
                                                 <button id="sp-diagnostic-export" class="sp-save-btn" type="button">${icon("copy")} 复制最近诊断日志</button>
                                             </div>
                                             <div class="sp-diagnostics-block">
-                                                <div class="sp-diagnostics-label">当前聊天诊断包</div>
+                                                <div class="sp-cfg-group">当前聊天诊断包</div>
                                                 <p class="sp-cfg-hint">包含两楼 AI 输入与原始回复，可能含剧情。它不是完整可导入备份，也不会包含 API 密钥、地址或请求头。</p>
                                                 <button id="sp-current-diagnostic-export" class="sp-save-btn" type="button">${icon("file-export")} 导出当前聊天诊断包</button>
+                                            </div>
+                                            <hr class="sp-mem-divider">
+                                            <div class="sp-diagnostics-block">
+                                                <div class="sp-cfg-group">窗口排查</div>
+                                                <p class="sp-cfg-hint">开始记录后返回间复现，收起键盘再回来复制。仅记录界面信息，一分钟后自动停止。</p>
+                                                <div class="sp-mem-actions">
+                                                    <button id="sp-window-diagnostic-start" class="sp-save-btn" type="button"><span id="sp-window-diagnostic-start-label">开始记录</span></button>
+                                                    <button id="sp-window-diagnostic-copy" class="sp-save-btn" type="button" title="复制窗口诊断" aria-label="复制窗口诊断" disabled>${icon("copy")} 复制结果</button>
+                                                    <button id="sp-window-diagnostic-export" class="sp-save-btn" type="button" title="导出窗口诊断文件" aria-label="导出窗口诊断文件" disabled>${icon("file-export")} 导出文件</button>
+                                                </div>
+                                                <span id="sp-window-diagnostic-status" class="sp-cfg-hint" role="status" aria-live="polite">尚未开始记录。</span>
                                             </div>
                                         </div>
                                     </details>
@@ -3979,14 +4030,20 @@ function injectModal() {
                         <div class="sp-lines-wrap" id="sp-lines-wrap" style="display:none">
                             <div class="sp-lines-toolbar" id="sp-lines-toolbar"></div>
                             <div class="sp-lines-list" id="sp-lines-list">
-                                <div class="sp-empty">${icon("line")}<p>还没有追踪的线，可以生成一版</p><button class="sp-gen-btn" id="sp-gen-lines-now">生成线</button></div>
+                                ${renderEmptyLinesState()}
                             </div>
                         </div>
 
                         <div class="sp-space-wrap" id="sp-space-wrap" style="display:none;flex-direction:column;flex:1;min-height:0">
                             <div class="sp-space-pages" id="sp-space-pages" role="tablist" aria-label="讨论窗口" hidden>
-                                <button type="button" role="tab" data-space-page="1" aria-selected="true">窗口1</button>
-                                <button type="button" role="tab" data-space-page="2" aria-selected="false" tabindex="-1">窗口2</button>
+                                <span class="sp-space-page" data-space-page-slot="1" role="presentation">
+                                    <button type="button" role="tab" data-space-page="1" aria-selected="true">窗口1</button>
+                                    <button type="button" class="sp-icon-btn sp-space-page-close" data-space-close-page="1" title="关闭窗口1" aria-label="关闭窗口1">${icon("x")}</button>
+                                </span>
+                                <span class="sp-space-page" data-space-page-slot="2" role="presentation">
+                                    <button type="button" role="tab" data-space-page="2" aria-selected="false" tabindex="-1">窗口2</button>
+                                    <button type="button" class="sp-icon-btn sp-space-page-close" data-space-close-page="2" title="关闭窗口2" aria-label="关闭窗口2">${icon("x")}</button>
+                                </span>
                             </div>
                             <div class="sp-space-failure-slot" id="sp-space-failure-slot"></div>
                             <div class="sp-chat-msgs" id="sp-space-msgs"></div>
@@ -3994,8 +4051,8 @@ function injectModal() {
                                 <div class="sp-action-menu sp-space-more-menu">
                                     <button type="button" id="sp-space-more" class="sp-icon-btn sp-action-menu-toggle" title="更多" aria-label="更多讨论操作" aria-expanded="false" aria-controls="sp-space-more-list">${icon("dots-vertical")}</button>
                                     <div class="sp-action-menu-list" id="sp-space-more-list" hidden>
+                                        <button type="button" id="sp-space-add-page" class="sp-action-menu-item">${icon("plus")}新增</button>
                                         <button type="button" id="sp-space-clear" class="sp-action-menu-item">${icon("clear-all")}清屏</button>
-                                        <button type="button" id="sp-space-add-page" class="sp-action-menu-item">${icon("plus")}新增窗口</button>
                                     </div>
                                 </div>
                                 <textarea id="sp-space-input" class="sp-input sp-chat-input-ta" rows="1" placeholder="聊点什么？"></textarea>
@@ -4044,8 +4101,8 @@ function injectModal() {
     });
     // shadow 内第一层 wrapper 必须带 sp-root + 主题类：style.css 的 `.sp-root ...` 前缀选择器、
     // .sp-night/.sp-day 色板、.sp-forced-* 强制主题覆盖全靠它匹配
-    // （applyTheme 同步它的主题类）。display:contents 不产生布局盒子，主宿主补偿原点后，
-    // .sp-sheet 继续使用可视视口坐标。
+    // （applyTheme 同步它的主题类）。display:contents 不产生布局盒子，
+    // .sp-sheet 使用主窗的可视视口坐标。
     root.innerHTML = `
         <link rel="stylesheet" href="${STYLESHEET_URL}">
         <div class="sp-root sp-${currentTheme}" style="display:contents">${html}</div>`;
@@ -4268,6 +4325,24 @@ function injectModal() {
         if (text) injectToST(text);
     });
 
+    // 楼内 ShadowRoot 的真实委托容器：与 Light DOM #chat 保持同一套业务入口。
+    // 只登记稳定 key；inlineFeature 会在冷启动和每个后续楼内根创建时调用。
+    const bindInlineChatEvents = target => {
+        if (!target) return;
+        const $target = target?.on && target?.off ? target : $(target);
+        $target.off?.('.spInlineChat');
+        $target.on('click.spInlineChat', '.sp-refresh-lines, .sp-inline-refresh-lines', function (e) { e.stopPropagation(); linesFeature.actions.reroll(); });
+        $target.on('click.spInlineChat', '.sp-advance-lines, .sp-inline-advance-lines', function (e) { e.stopPropagation(); linesFeature.actions.advance(); });
+        $target.on('click.spInlineChat', '.sp-inline-refresh-dashed', function (e) { e.stopPropagation(); linesFeature.dashed.run({ reroll: true }); });
+        $target.on('click.spInlineChat', '.sp-line-del-one', function (e) { e.stopPropagation(); const idx = Number($(this).attr('data-line-idx')); if (Number.isInteger(idx)) linesFeature.actions.delete(idx); });
+        $target.on('click.spInlineChat', '.sp-line-pin-toggle', function (e) { e.stopPropagation(); const idx = Number($(this).attr('data-line-idx')); if (Number.isInteger(idx)) linesFeature.actions.pin(idx); });
+        $target.on('click.spInlineChat', '.sp-adult-sensitive', revealAdult);
+        $target.on('keydown.spInlineChat', '.sp-adult-sensitive', revealAdultKey);
+        $target.on('click.spInlineChat', '.sp-sch-del-one', function (e) { e.stopPropagation(); const day = $(this).attr('data-day'); const idx = Number($(this).attr('data-ev')); if (Number.isInteger(idx)) triggerDeletePointEvent(day === 'future' ? 'future' : Number(day), idx, { view: 'user', charName: '' }); });
+        $target.on('click.spInlineChat', '.sp-inject-btn', function () { const text = _injectTexts[$(this).data('iid')]; if (text) injectToST(text); });
+    };
+    registerInlineRootBinding('chat-events', bindInlineChatEvents);
+
     // 点/线面板底部引导只切到间，不预填、不生成；用户需说明目标并请求可应用方案
     // 点与线的入口都由同一委托处理。
     $inAll('#sp-body, #sp-lines-wrap').on('click', '.sp-jump-link', () => $in('.sp-view-btn[data-view="space"]').trigger('click'));
@@ -4301,7 +4376,7 @@ function injectModal() {
         batchBar.find('.sp-batch-exec').prop('disabled', count === 0);
     };
     bindLedgerEvents({
-        almanac: $almanac, chat: $('#chat'), $,
+        almanac: $almanac, chat: $('#chat'), bindInlineRoots: binder => registerInlineRootBinding('ledger', binder), $,
         capture: { run: runLedgerCaptureStep, abort: () => ledgerCaptureController.abort(), prepareAbandon: () => ledgerCaptureController.prepareAbandon?.(), abandon: token => ledgerCaptureController.abandon?.(token), confirmAbandon: () => spConfirm({ title: '放弃未确认候选', body: '只会放弃仍未找到可靠来源的候选；已经逐批保存的刻度条目不会删除。', confirmText: '放弃待查', cancelText: '继续保留' }) },
         judge: { run: runLedgerJudgeStep }, captureState: () => ({ busy: ledgerCaptureController.isBusy, controller: ledgerCaptureController.abortController }), actions: ledgerActions,
         render: renderAlmanacPanel,
@@ -4546,6 +4621,17 @@ function injectModal() {
         });
     });
     $in('#sp-current-diagnostic-export').on('click', () => { void exportCurrentChatDiagnosticPackage(); });
+    windowDiagnostics?.stop('remount');
+    windowDiagnostics = bindWindowDiagnosticControls({
+        root: _spShadow, windowRef: window, sourceUrl: import.meta.url,
+        elements: () => ({ root: document.getElementById(MODAL_ID), sheet: inEl('.sp-sheet'), shadow: _spShadow,
+            dialogHost: document.getElementById(DIALOG_HOST_ID), fab: document.getElementById(FAB_ID),
+            input: inEl('#sp-space-input'), settingsBody: inEl('.sp-settings-body'), messages: inEl('#sp-space-msgs') }),
+        readUiState: () => ({ module: _lastMainView, settingsOpen }),
+        copyText: copyPlainText, promptTextarea: options => customDialog.promptTextarea(options),
+        downloadJson: data => downloadDiagnosticPackage(data),
+        notify: (message, isError) => showToast(message, null, isError),
+    });
     bindApiPresetEvents();
     $in('#sp-qr-shortcuts').on('change', 'input[data-qr-shortcut]', function () {
         const key = this.dataset.qrShortcut;
@@ -4599,6 +4685,7 @@ function injectModal() {
         saveSettingsDebounced();
         // Refresh chat area: on → back-fill latest floor with block; off → clear all
         backfillLinesInlineBlocks();
+        if (linesMode) linesFeature.refreshPanel();
     });
     // 线·楼内块显隐开关（独立于线主开关 linesEnabled）：立刻生效。渲染窗口按段开关重算所有窗内楼。
     // 线的推进与潜伏注入不受影响（refreshLinesInjection 另在 backfill/sync 路径）。
@@ -4670,7 +4757,7 @@ function injectModal() {
         refreshStoryClockInjection({ announce: true });
         if (axisState.almanacMode) renderAlmanacPanel();
     });
-    // 冷知识自动开关：off 只停随线生成与楼层展示，历史保留并仍可在线面板查看。
+    // 冷知识开关管生成和楼内显示，已有冷知识仍可在线面板查看。
     $in('#sp-dashed-enabled').on('change', function () {
         getSettings().dashedEnabled = this.checked;
         saveSettingsDebounced();
@@ -4779,6 +4866,10 @@ function injectModal() {
         getSettings().ledgerCaptureEnabled = this.checked;
         saveSettingsDebounced();
         ledgerCaptureCounter = 0;
+        ledgerJudgeCounter = 0;
+        refreshLedgerInjection();
+        refreshInlineWindow(true);
+        if (axisState.almanacMode && axisState._almanacSheet === 'ledger') renderAlmanacPanel();
     });
     $in('#sp-ledger-capture-interval').on('change', function () {
         const n = normalizeLedgerInterval(this.value, 5);
@@ -5339,6 +5430,7 @@ function pointScheduleEmptyHtml() {
 }
 
 function showPanel() {
+    windowDiagnostics?.record('panel.open-requested');
     const $root  = $(`#${MODAL_ID}`);
     const sheet  = inEl('.sp-sheet');
     // Clear inline animation so the CSS open-animation replays on every show
@@ -5357,6 +5449,7 @@ function showPanel() {
 }
 
 function closePanel() {
+    windowDiagnostics?.record('panel.close-requested');
     onDragEnd(null, false);
     onResizeEnd(null, false);
     // 关闭主面板时取消活动确认，但独立弹窗宿主本身不隐藏。
@@ -5370,6 +5463,8 @@ function closePanel() {
     customDialog.cancelActive();
     $(`#${MODAL_ID}`).stop(true).animate({ opacity: 0 }, 150, function () {
         $(this).css('display', 'none');
+        windowDiagnostics?.record('panel.closed');
+        windowDiagnostics?.stop('panel-closed');
     });
 }
 
@@ -6067,9 +6162,8 @@ function getDateAnchor(charKey) {
         if (local.calibration) {
             if (!local.calibration || !Number.isInteger(local.calibration.weekday)) return null;
             const current = latestStoryClockPure(getContext(), ALM_CHAT_SCAN_LIMIT);
-            // 半残 SDC 只能作为人工校准的日期相位，不能提前停用校准；
-            // 只有当前 AI 楼的 start/end 两侧都完整且无重复歧义时才允许接管。
-            if (completeStoryClockPure(current)) {
+            // 可靠日期与星期才允许接管人工星期锚；未知时刻不影响星期依据。
+            if (current && !current.duplicate && current.ordered && current.endMeta?.date && Number.isInteger(current.endMeta?.weekdayIndex)) {
                 const calibrationFloor = local.calibration?.floor;
                 if (!Number.isInteger(calibrationFloor) || current.floor !== calibrationFloor) return null;
             }
@@ -6716,13 +6810,7 @@ function worldInfoKeyMatchesText(text, rawKey, entry, ctx) {
 function worldInfoTitleSupplementAllows(entry, triggerText, ctx) {
     const raw = entry?.activationEntry || {};
     if (raw.disable === true || (Array.isArray(raw.triggers) && raw.triggers.length && !raw.triggers.includes('quiet'))) return false;
-    const names = raw.characterFilter?.names;
-    if (Array.isArray(names) && names.length) {
-        const includesName = names.includes(getCharaFilename());
-        if (raw.characterFilter.isExclude ? includesName : !includesName) return false;
-    }
-    // Tag filters depend on host tag-map state that has no read-only resolver here; fail closed.
-    if (Array.isArray(raw.characterFilter?.tags) && raw.characterFilter.tags.length) return false;
+    if (!worldInfoCharacterFilterAllows(raw.characterFilter)) return false;
     // These outcomes depend on host chat/timed-effect state; a title-only path has no safe read-only equivalent.
     if (raw.decorators?.includes?.('@@dont_activate') || raw.decorators?.includes?.('@@activate') || raw.constant || raw.group || raw.delay || raw.delayUntilRecursion || raw.cooldown || raw.sticky) return false;
     // A simple person card may be absent from the host dry-run because its scan budget
@@ -6743,7 +6831,17 @@ function worldInfoTitleSupplementAllows(entry, triggerText, ctx) {
     return true;
 }
 
-async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '', triggerMode = 'query', referenceHistory, onGenerationPhase, signal } = {}) {
+function worldInfoCharacterFilterAllows(filter) {
+    const names = filter?.names;
+    if (Array.isArray(names) && names.length) {
+        const includesName = names.includes(getCharaFilename());
+        if (filter.isExclude ? includesName : !includesName) return false;
+    }
+    // Tag filters need host tag-map state for a read-only applicability check.
+    return !Array.isArray(filter?.tags) || !filter.tags.length;
+}
+
+async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '', triggerMode = 'query', referenceHistory, onGenerationPhase, signal, includeTitleDirectory = false } = {}) {
     const reportPhase = phase => { try { onGenerationPhase?.(phase); } catch {} };
     const throwIfAborted = () => { if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError'); };
     reportPhase('world-info-books');
@@ -6769,6 +6867,13 @@ async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '
     const selected = entries
         .filter(e => worldInfoSelectionAllows(selection, e.key))
         .filter(e => e.hostEnabled !== false);
+    const titleRows = includeTitleDirectory ? selected
+        .filter(entry => worldInfoCharacterFilterAllows(entry.activationEntry?.characterFilter))
+        .flatMap(entry => {
+            const title = String(entry.title ?? '').replace(/\s+/gu, ' ').trim();
+            return title ? [`- ${entry.source}｜${title}`] : [];
+        }) : [];
+    const titleDirectory = titleRows.length ? `【当前可读世界书标题目录】\n${titleRows.join('\n')}` : '';
     let effectiveTriggerText = triggerText;
     // 「间」可凭自己的历史快照解析回指；面内只有本轮明确要求全体角色时才能直接列名单。
     const explicitAllRosterQuery = WORLD_INFO_ALL_ROLES.test(String(triggerText || ''))
@@ -6813,7 +6918,7 @@ async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '
             lukerAvailable: typeof ctx?.simulateWorldInfoActivation === 'function',
             nativeAvailable: typeof worldInfoCore.checkWorldInfo === 'function',
         });
-        return '';
+        return titleDirectory;
     }
     const candidates = selected
         .filter(e => activation.keys.has(worldInfoCandidateKey(e.source, e.uid))
@@ -6836,7 +6941,7 @@ async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '
             warning: '宿主 API 未返回预算溢出标记；硬上限或外部扫描 prompt 可能导致宿主在构画筛选前省略候选。',
         });
     }
-    if (!candidates.length) return '';
+    if (!candidates.length) return titleDirectory;
     const result = `【世界书】\n${candidates.join('\n\n')}`;
     // Final diagnostics are observational only: never wait for the host tokenizer after selection; send chosen entries unchanged.
     const estimate = estimateWorldInfoTokens(result);
@@ -6847,7 +6952,7 @@ async function buildWorldInfoContext(ctx, { triggerText, titleSupplementText = '
         exactCount: estimate.exact,
         warning: '构画不裁剪已命中的世界书；宿主扫描预算仍可能使宿主在构画筛选前省略候选。',
     });
-    return result;
+    return titleDirectory ? `${titleDirectory}\n\n${result}` : result;
 }
 
 // Read Anima's summary layer from the chat-bound worldbook. Anima persists each
@@ -6992,8 +7097,7 @@ const qianQianJieMemoryAccess = createQianQianJieMemoryAccess({
     isSelected: () => getSettings().useQianQianJie === true,
 });
 
-// Alternate sources are mutually exclusive; only an explicitly confirmed per-request
-// fallback may omit a source. Read failures otherwise propagate to the generation UI.
+// Read from the selected memory source. Each caller decides whether a failure blocks its request.
 async function _getMemTextRaw(opts = {}) {
     const { excludeMesIds, maxFloor, source, ...sourceOpts } = opts;
     const s = getSettings();
@@ -7009,7 +7113,8 @@ async function _getMemTextRaw(opts = {}) {
             const result = await qianQianJieMemoryAccess.result({ ...sourceOpts, recentText, maxFloor });
             if (result.status === 'cancelled') throw new DOMException('The operation was aborted.', 'AbortError');
             if (['read-failed', 'timed-out', 'error', 'api-unavailable', 'disabled', 'stale', 'not-ready', 'unavailable'].includes(result.status)) {
-                throw makeDiagnosticError('memory-read', { phase: 'memory' });
+                const code = result.status === 'stale' ? 'memory-stale' : 'memory-read';
+                throw makeDiagnosticError(code, { phase: 'memory' });
             }
             return result.text || '';
         } catch (err) {
@@ -7141,11 +7246,16 @@ async function buildMessages(ctx, prompt, userName, charName, historyLimit = 3, 
             .filter(floor => Number.isInteger(Number(floor)))
             .map(String);
     }
+    const almanacText = resolveAlmanacContextText(opts, () => getAlmanacInjectText(clockBoundary?.meta?.date || null));
+    const memoryReadOptions = {
+        query: buildGenerationMemoryQuery(prompt, opts, almanacText),
+        recentText: history.map(message => message.content).join('\n\n'),
+    };
     let qqjMemoryText;
     if (opts.includeMemory !== false && opts.memorySnapshot?.source === 'qianqianjie') {
         if (!qianQianJieGenerationSnapshotCurrent(opts.memorySnapshot, opts.memoryOperationToken, ctx)) throw makeDiagnosticError('memory-stale', { phase: 'memory-preflight' });
         reportPhase('memory');
-        qqjMemoryText = await getMemText({ source: 'qianqianjie', query: prompt, recentText: history.map(message => message.content).join('\n\n'), signal: opts.signal, maxFloor: opts.ledgerCutoffFloor });
+        qqjMemoryText = await getMemText({ source: 'qianqianjie', ...memoryReadOptions, signal: opts.signal, maxFloor: opts.ledgerCutoffFloor });
         throwIfAborted();
         if (!qianQianJieGenerationSnapshotCurrent(opts.memorySnapshot, opts.memoryOperationToken, ctx)) throw makeDiagnosticError('memory-stale', { phase: 'memory-preflight' });
         if (!String(qqjMemoryText || '').trim()) {
@@ -7190,13 +7300,13 @@ async function buildMessages(ctx, prompt, userName, charName, historyLimit = 3, 
             } else if (snapshot?.status === 'read-required') {
                 if (!isMemoryReadSnapshot(snapshot)) throw makeDiagnosticError('memory-stale', { phase: 'memory-preflight' });
                 reportPhase('memory');
-                rawMemText = await getMemText({ source: snapshot.source, full: opts.fullMemory, query: prompt, signal: opts.signal, operationToken: opts.memoryOperationToken, excludeMesIds: memoryExcludeMesIds, maxFloor: opts.ledgerCutoffFloor });
+                rawMemText = await getMemText({ source: snapshot.source, full: opts.fullMemory, ...memoryReadOptions, signal: opts.signal, operationToken: opts.memoryOperationToken, excludeMesIds: memoryExcludeMesIds, maxFloor: opts.ledgerCutoffFloor });
             } else {
                 throw makeDiagnosticError('memory-stale', { phase: 'memory-preflight' });
             }
         } else {
             reportPhase('memory');
-            rawMemText = await getMemText({ full: opts.fullMemory, query: prompt, signal: opts.signal, operationToken: opts.memoryOperationToken, excludeMesIds: memoryExcludeMesIds, maxFloor: opts.ledgerCutoffFloor });
+            rawMemText = await getMemText({ full: opts.fullMemory, ...memoryReadOptions, signal: opts.signal, operationToken: opts.memoryOperationToken, excludeMesIds: memoryExcludeMesIds, maxFloor: opts.ledgerCutoffFloor });
         }
         memText = sanitizeGenerationContextText(rawMemText, { reroll: opts.reroll });
     }
@@ -7212,7 +7322,6 @@ async function buildMessages(ctx, prompt, userName, charName, historyLimit = 3, 
         : '';
 
     // 历（本世界观重要日期）：供构画生成与讨论上下文使用，不做主楼常驻注入。
-    const almanacText = resolveAlmanacContextText(opts, () => getAlmanacInjectText(clockBoundary?.meta?.date || null));
     const almanacBlock = almanacText
         ? `【本世界观·重要日期（历）】以下是这个世界的既定节日、生日、纪念日等重要日子，已按「当前剧情日期」标注倒计时；每条冒号后的「说明」是该日子的既定设定（由来、涉及人物阵营、习俗活动、持续天数等），是背景事实。\n${almanacText}\n\n★ 推演点/线/大纲时：凡列在【近期将至】里的日子（未来数日内或进行中），应**主动**把它纳入近期剧情——依据其「说明」里的设定生成与之相关的铺垫、筹备、事件或人物动向，让故事顺着该世界的历法自然推进；【全年其他重要日子】作为背景，时间线接近时再纳入考量。\n★ 务必尊重每条「说明」里的既定设定，据此展开合理、可延续的剧情；说明里没写到的细节可以合理补完，但**不得编造与既定设定冲突的内容**。`
         : '';
@@ -7310,6 +7419,13 @@ function renderAiMessageHtml(text, sanitizerOverrides = {}) {
     return escapeHtml(String(text ?? '')).replace(/\n/g, '<br>');
 }
 
+
+function renderSpaceReplyHtml(text, sanitizerOverrides = {}) {
+    return renderAiMessageHtml(text, {
+        FORBID_TAGS: ['button', 'input', 'textarea', 'select', 'option', 'form', 'iframe', 'object', 'embed'],
+        ...sanitizerOverrides,
+    });
+}
 
 // idx0 从 0 起。就地替换 calendar_widget 内第 idx0 个 Event: 行（保留其 Day/Future 归属与缩进），找不到返回 null。
 function replaceNthEventLine(raw, idx0, newEventLine) {
@@ -8117,7 +8233,8 @@ function bindStorageHandlers() {
 
 
 function renderEmptyLinesState() {
-    return `<div class="sp-empty">${icon("line")}<p>还没有追踪的线，可以生成一版</p><button class="sp-gen-btn" id="sp-gen-lines-now">生成线</button></div>`;
+    const hint = getSettings().linesEnabled === false ? '还没有追踪的线，开启线功能后可生成' : '还没有追踪的线，可以生成一版';
+    return `<div class="sp-empty">${icon("line")}<p>${hint}</p><button class="sp-gen-btn" id="sp-gen-lines-now">生成线</button></div>`;
 }
 
 async function triggerGenerateLines() {
@@ -9280,6 +9397,12 @@ function syncPrimaryTextColor(theme) {
 function syncInlineTheme(theme = detectSTTheme()) {
     document.querySelectorAll('.sp-inline-box').forEach(root => syncUiTheme(root, theme));
     syncVectorGlyphTheme(document, theme);
+    for (const shadowRoot of inlineFeature?.getRoots?.() || []) {
+        const box = shadowRoot.querySelector?.('.sp-inline-box');
+        if (box) syncUiTheme(box, theme);
+        syncVectorGlyphTheme(shadowRoot, theme);
+        if (shadowRoot.host) refreshUserNameMask(shadowRoot.host);
+    }
 }
 
 function applyTheme(theme) {
@@ -9485,12 +9608,16 @@ function positionPanel() {
 function bindViewportSync() {
     if (viewportSyncBound) return;
     viewportSyncBound = true;
-    const onViewportChange = () => {
+    const onViewportChange = event => {
         closeActionMenus();
         onDragEnd(null, false);
         onResizeEnd(null, false);
-        if (viewportSyncFrame !== null) return;
-        const callback = () => { viewportSyncFrame = null; syncPanelViewport(); };
+        if (viewportSyncFrame !== null) {
+            if (event?.type !== 'orientationchange') return;
+            if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(viewportSyncFrame);
+            else clearTimeout(viewportSyncFrame);
+        }
+        const callback = () => { viewportSyncFrame = null; syncPanelViewport(event?.type !== 'orientationchange'); };
         viewportSyncFrame = typeof window.requestAnimationFrame === 'function'
             ? window.requestAnimationFrame(callback)
             : setTimeout(callback, 16);
@@ -9504,16 +9631,36 @@ function bindViewportSync() {
     }
 }
 
-function syncPanelViewport() {
+function syncPanelViewport(preserveEditingGeometry = false) {
+    windowDiagnostics?.record('sync.requested', { preserveEditingGeometry });
     const dialogHost = document.getElementById(DIALOG_HOST_ID);
     if (dialogHost) syncDialogViewport(dialogHost);
     const root  = document.getElementById(MODAL_ID);
     const sheet = inEl('.sp-sheet');   // .sp-sheet 在 shadow 内：document.querySelector('#sp-modal-root .sp-sheet') 跨不过边界→null→整个移动端视口同步静默失效；用 inEl 查 shadow root
-    if (!root || !sheet || root.style.display === 'none') return;
-    // 保持子面板的视口坐标，抵消宿主根包含块的文档滚动原点。
-    root.style.transform = 'translate(0px, 0px)';
+    if (!root || !sheet || root.style.display === 'none') { windowDiagnostics?.record('sync.inactive'); return; }
+    const mobile = isMobile();
+    if (preserveEditingGeometry && mobile) {
+        const userAgent = globalThis.navigator?.userAgent || '';
+        const phoneBrowser = /iPhone|iPod/i.test(userAgent) && (/Version\/[\d.]+.*Safari\//i.test(userAgent) || /FxiOS\//i.test(userAgent));
+        const focused = _spShadow?.activeElement;
+        const editing = focused?.isContentEditable || !focused?.readOnly && (focused?.tagName === 'TEXTAREA'
+            || focused?.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(focused.type));
+        // 手机浏览器已为输入框平移页面时，保留主窗几何，避免再缩短窗口把输入区送出屏幕。
+        // 显式打开和旋转继续定位；独立弹窗已在上方同步。
+        if (phoneBrowser && editing) { windowDiagnostics?.record('sync.preserved', { preserveEditingGeometry, mobile }); return; }
+    }
+    // 手机键盘平移时保留浏览器给 fixed 层的可视坐标；仅真实页面滚动才补偿
+    // 宿主 html 的 fixed 包含块，避免把 visualViewport.offsetTop 再算成上移量。
+    root.style.transform = mobile ? '' : 'translate(0px, 0px)';
     const origin = root.getBoundingClientRect();
-    root.style.transform = `translate(${-origin.left}px, ${-origin.top}px)`;
+    const pageLeft = Number(window.scrollX ?? window.pageXOffset) || 0;
+    const pageTop = Number(window.scrollY ?? window.pageYOffset) || 0;
+    // getBoundingClientRect already contains the page-scroll displacement; scroll
+    // coordinates are only the signal that a mobile root offset is real document
+    // movement rather than visualViewport pan.
+    if (!mobile || pageLeft !== 0 || pageTop !== 0) {
+        root.style.transform = `translate(${-origin.left}px, ${-origin.top}px)`;
+    }
 
     // Read safe-area insets from CSS env() via a probe element.
     // Fallback to 0 when unsupported (older Android browsers).
@@ -9528,7 +9675,7 @@ function syncPanelViewport() {
     const view = readPanelViewport(window);
     const settingsBody = settingsOpen ? inEl('.sp-settings-body') : null;
     const savedScrollTop = settingsBody?.scrollTop;
-    if (isMobile()) {
+    if (mobile) {
         sheet.style.left = `${view.left + view.width / 2}px`;
         // Match QQJ's mobile default; the viewport offset already accounts for keyboard/pan movement.
         sheet.style.top = `${view.top + Math.max(20, safeTop)}px`;
@@ -9549,6 +9696,8 @@ function syncPanelViewport() {
         sheet.style.maxWidth = `${Math.max(0, view.width - 20)}px`;
         sheet.style.maxHeight = `${Math.max(0, view.height - 20)}px`;
     }
+    windowDiagnostics?.record('sync.applied', { preserveEditingGeometry, mobile,
+        safeTop, safeBottom: safeBot, rootOriginLeft: origin.left, rootOriginTop: origin.top });
     if (!settingsBody) return;
     if (settingsBody.scrollTop !== savedScrollTop) settingsBody.scrollTop = savedScrollTop;
 

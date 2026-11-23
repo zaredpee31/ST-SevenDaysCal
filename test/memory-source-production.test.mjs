@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { selectVisibleChatHistory } from '../business/lines/history.js';
 import { getSharedBodyWrappers } from '../utils/shared-body-wrappers.js';
 import { createQianQianJieMemoryAccess, QIANQIANJIE_BRIDGE_KEY } from '../business/memory/qianqianjie.js';
+import { createSpaceFeature } from '../business/space/feature.js';
+import { makeDiagnosticError } from '../api/diagnostics.js';
+import { buildGenerationMemoryQuery } from '../runtime/generation-context.js';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = fs.readFileSync(path.join(repo, 'index.js'), 'utf8');
@@ -40,7 +43,7 @@ function precheckHarness(result, { confirmed = true } = {}) {
     return { ...funcs, titles };
 }
 
-function buildHarness({ getMemText, confirm = async () => true, settings = { useDatabase: true, useAnima: false, useBaiBaiBook: false, useQianQianJie: false }, qianQianJieGenerationSnapshotCurrent = () => false }) {
+function buildHarness({ getMemText, confirm = async () => true, settings = { useDatabase: true, useAnima: false, useBaiBaiBook: false, useQianQianJie: false }, qianQianJieGenerationSnapshotCurrent = () => false, almanacText = '' }) {
     const historyBuilder = evaluate(indexHistory, 'buildGenerationHistoryContext', {
         getSettings: () => ({ keepTags: '', extraTags: '' }),
         getWrapperSettings: () => getSharedBodyWrappers({}),
@@ -52,10 +55,12 @@ function buildHarness({ getMemText, confirm = async () => true, settings = { use
     const stale = Object.assign(new Error('stale'), { diagnosticCode: 'memory-stale' });
     return evaluate(buildMessagesRegion, 'buildMessages', {
         buildGenerationHistoryContext: historyBuilder,
+        buildGenerationMemoryQuery,
         buildWorldInfoContext: async () => '',
         readCardExtras: () => ({ personaDesc: '', authorNote: '' }),
         getSettings: () => ({ ...settings, keepTags: '', extraTags: '' }),
-        getAlmanacInjectText: () => '', resolveAlmanacContextText: () => '', getCalDescInjectText: () => '',
+        getAlmanacInjectText: () => almanacText, resolveAlmanacContextText: (opts, read) => opts.noAlmanac ? '' : read(), getCalDescInjectText: () => '',
+        latestStoryClockPure: () => null, ALM_CHAT_SCAN_LIMIT: 100,
         sanitizeGenerationContextText: value => String(value ?? ''),
         isConfirmedMemoryFallback: snapshot => snapshot?.status === 'fallback-confirmed'
             && ['database', 'anima', 'bai-bai-book'].includes(snapshot.source),
@@ -99,6 +104,29 @@ test('QQJ preflight defers topic reading until the actual generation question is
     assert.equal(reads.length, 1); assert.ok(reads[0].query.includes('灯塔')); assert.ok(reads[0].query.includes('书店'));
     assert.equal(text.split('过去在灯塔约定来年重逢。').length - 1, 1);
     assert.ok(!text.includes('无关的旧召回')); assert.equal(promptReads, 0);
+});
+
+test('planning memory uses upcoming story facts and clean narrative while format instructions remain in the model request', async () => {
+    const reads = [];
+    const almanacText = '【当前剧情日期】3月21日\n【近期将至】\n- 还有7天：3月28日 林岚生日\n【全年其他重要日子】\n- 年末周年庆';
+    const build = buildHarness({ almanacText, getMemText: async options => { reads.push(options); return '她已经告知生日。'; },
+        settings: { useQianQianJie: true }, qianQianJieGenerationSnapshotCurrent: () => true });
+    const ctx = { chat: [{ is_user: false, mes: '林岚和周宁正在书店商量周末。' }], characters: {} };
+    const template = '输出格式、抽签票据、旧主题名称';
+    const messages = await build(ctx, template, '林岚', '周宁', 3,
+        { includeCurrentStoryTime: true, memorySnapshot: { source: 'qianqianjie', status: 'read-required' } });
+    assert.equal(reads.length, 1); assert.match(reads[0].query, /林岚生日/);
+    assert.doesNotMatch(reads[0].query, /输出格式|抽签票据|旧主题|年末周年庆/);
+    assert.match(reads[0].recentText, /商量周末/);
+    assert.equal(messages.at(-1).content, template);
+});
+
+test('planning without upcoming dates uses the actual narrative with the same selected memory source', async () => {
+    const reads = [];
+    const build = buildHarness({ getMemText: async options => { reads.push(options); return '相关旧事'; } });
+    await build({ chat: [{ is_user: false, mes: '两人在码头核对来信。' }], characters: {} }, '创作格式模板', '林岚', '周宁', 3, { includeCurrentStoryTime: true });
+    assert.equal(reads.length, 1); assert.equal(reads[0].query, '');
+    assert.match(reads[0].recentText, /码头核对来信/);
 });
 
 test('QQJ topic-empty fallback confirms once, keeps six recent floors and does not reread', async () => {
@@ -225,6 +253,49 @@ test('worldbook read exceptions are reported while successful books remain injec
     assert.doesNotMatch(notices[0], /已读取的书仍会参与生成/);
 });
 
+test('Space worldbook directory lists readable headings while bodies still require activation', async () => {
+    const entries = [
+        { source: '示例书', uid: 1, key: 'rule', title: '副本生成规范', content: '命中的生成规范正文' },
+        { source: '示例书', uid: 2, key: 'fixed', title: '预写冒险', content: '没有命中的冒险正文' },
+        { source: '示例书', uid: 3, key: 'off', title: '已关闭条目', hostEnabled: false },
+        { source: '示例书', uid: 4, key: 'unselected', title: '构画未勾选条目' },
+        { source: '排除书', uid: 5, key: 'excluded', title: '排除整书中的条目' },
+        { source: '示例书', uid: 6, key: 'other-card', title: '另一角色的条目', activationEntry: { characterFilter: { names: ['另一角色'] } } },
+    ];
+    let reads = 0;
+    let activation = new Set(['示例书::1']);
+    const build = evaluate(region('function worldInfoTitleSupplementAllows(', "// Read Anima's summary layer"), 'buildWorldInfoContext', {
+        WORLD_INFO_ALL_ROLES: /$a/, WORLD_INFO_GROUP_INFO_TOPIC: /$a/,
+        WORLD_INFO_SCAN_BUDGET: 100,
+        getCharBookEntries: async () => { reads++; return entries; },
+        getWiExcludeSet: () => new Set(['排除书']),
+        hasWiExcluded: (source, excluded) => excluded.has(source),
+        ensureCurrentWiSelection: () => ({}),
+        worldInfoSelectionAllows: (_selected, key) => key !== 'unselected',
+        getCharaFilename: () => '当前角色',
+        worldInfoCandidateKey: (world, uid) => `${world}::${uid}`,
+        resolveWorldInfoActivation: async () => ({ failed: false, keys: activation }),
+        countWorldInfoTokens: async () => ({ tokens: 8, exact: true }),
+        worldInfoTitleMatches: () => false,
+        worldInfoPersonTitleMatches: () => false,
+        worldInfoCore: { world_info_budget_cap: 0, world_info_budget: 100 },
+        console: { warn() {}, info() {} },
+        estimateWorldInfoTokens: () => ({ tokens: 4, exact: true }),
+    });
+    const triggerText = '世界书里有预写的副本吗';
+    const selected = await build({}, { triggerText, includeTitleDirectory: true });
+    assert.equal(reads, 1);
+    assert.match(selected, /当前可读世界书标题目录/);
+    assert.match(selected, /预写冒险/);
+    assert.match(selected, /命中的生成规范正文/);
+    assert.doesNotMatch(selected, /没有命中的冒险正文|已关闭条目|未勾选条目|排除整书|另一角色/);
+    assert.equal(await build({}, { triggerText }), '【世界书】\n命中的生成规范正文');
+    activation = new Set();
+    const directoryOnly = await build({}, { triggerText, includeTitleDirectory: true });
+    assert.match(directoryOnly, /预写冒险/);
+    assert.doesNotMatch(directoryOnly, /命中的生成规范正文|没有命中的冒险正文/);
+});
+
 test('worldbook query without a trusted person roster keeps the original query', async () => {
     const runQuery = ({ names = [], recognized = true, failRead = false } = {}) => {
         const activations = [];
@@ -319,6 +390,58 @@ test('QQJ direct reader receives the cutoff and no newer recent-body material', 
 test('cancelled direct QQJ read propagates AbortError rather than empty material', async () => {
     const read = evaluate(externalReadRegion, '_getMemTextRaw', { getSettings: () => ({ useQianQianJie: true }), getContext: () => ({ chat: [] }), buildGenerationHistoryContext: () => ({ history: [] }), qianQianJieMemoryAccess: { result: async () => ({ status: 'cancelled', text: '' }) }, DOMException, makeDiagnosticError: () => new Error('wrong read error'), safeDiagnosticLog: () => ({}), console: { warn() {} } });
     await assert.rejects(read({ query: '旧事' }), error => error.name === 'AbortError');
+});
+
+test('Space sends the opening question and continues the discussion when its memory source cannot be read', async () => {
+    const host = { chatId: 'opening', name1: '用户', name2: '角色', chat: [] };
+    const settings = { useQianQianJie: true };
+    let memoryStatus = 'not-ready';
+    let memoryReads = 0;
+    const requests = [];
+    const read = evaluate(externalReadRegion, '_getMemTextRaw', {
+        getSettings: () => settings, getContext: () => host,
+        buildGenerationHistoryContext: () => ({ history: [] }),
+        qianQianJieMemoryAccess: { result: async () => { memoryReads++; return { status: memoryStatus, text: '' }; } },
+        DOMException, makeDiagnosticError, safeDiagnosticLog: () => ({}), console: { warn() {} },
+    });
+    const space = createSpaceFeature({
+        context: () => host,
+        keyDesc: () => ({ kind: 'space-chat', view: 'user', charName: '' }),
+        writeStore: () => true,
+        loadConfig: () => ({ url: 'fixture', key: 'fixture' }),
+        contextEnv: {
+            context: () => host, settings: () => settings,
+            readMemory: (_ctx, query) => read({ query }),
+            readCharacterData: () => '港口有一座废弃灯塔',
+            readRecent: () => host.chat[0]?.mes || '',
+        },
+        postCompletion: async ({ messages }) => {
+            requests.push(messages);
+            return '可以从灯塔说起。';
+        },
+    });
+
+    const firstQuestion = '我们来聊聊这个故事怎么开场';
+    assert.equal((await space.chat.send(firstQuestion)).status, 'updated');
+    assert.equal(requests.length, 1);
+    assert.match(requests[0][0].content, /港口有一座废弃灯塔/);
+    assert.equal(requests[0].at(-1).content, firstQuestion);
+
+    memoryStatus = 'read-failed';
+    host.chat.push({ mes: '灯塔上的钟停在午夜' });
+    const followUp = '沿着刚才的思路再想一个开头';
+    assert.equal((await space.chat.send(followUp)).status, 'updated');
+    assert.equal(requests.length, 2);
+    assert.match(requests[1][0].content, /灯塔上的钟停在午夜/);
+    assert.ok(requests[1].some(message => message.content === '可以从灯塔说起。'));
+    assert.equal(requests[1].at(-1).content, followUp);
+    assert.equal(memoryReads, 2);
+
+    memoryStatus = 'stale';
+    const stale = await space.chat.send('再聊聊地点');
+    assert.equal(stale.status, 'failed');
+    assert.equal(stale.error.diagnosticCode, 'memory-stale');
+    assert.equal(requests.length, 2);
 });
 
 

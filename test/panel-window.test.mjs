@@ -93,17 +93,19 @@ test('normal mobile sync keeps viewport margins with one safe-area inset and ign
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
   assert.match(css, /\.sp-sheet\s*\{[^}]*top\s*:\s*max\(20px, env\(safe-area-inset-top, 0px\)\)/);
-  const start = source.indexOf('function syncPanelViewport() {');
+  const start = source.indexOf('function syncPanelViewport(');
   const end = source.indexOf('// ─── Toast (top)', start);
   for (const width of [390, 320]) {
-    const sheet = { style: {} }, root = { style: {}, getBoundingClientRect: () => rect(0, -500, width, 844) };
+    let originTop = 0;
+    const sheet = { style: {} }, root = { style: {}, getBoundingClientRect: () => rect(0, originTop, width, 844) };
     const nodes = { chat: rect(10, 50, width - 20, 700) };
     const win = { innerWidth: width, innerHeight: 844 };
     let safeTop = 0, safeBottom = 0;
     const document = { ...fixture(nodes), getElementById: id => id === 'panel' ? root : fixture(nodes).getElementById(id),
       createElement: () => ({ style: {} }), body: { appendChild() {}, removeChild() {} } };
-    const context = { document, window: win, MODAL_ID: 'panel', DIALOG_HOST_ID: 'dialog', syncDialogViewport: layout.syncDialogViewport, settingsOpen: false, inEl: () => sheet,
-      isMobile: () => true, readPanelViewport: layout.readPanelViewport,
+    const context = { document, window: win, windowDiagnostics: null, MODAL_ID: 'panel', DIALOG_HOST_ID: 'dialog', syncDialogViewport: layout.syncDialogViewport, settingsOpen: false, inEl: () => sheet,
+      isMobile: () => win.innerWidth <= 640, readPanelViewport: layout.readPanelViewport,
+      fitDesktopPanel: layout.fitDesktopPanel, localStorage: { getItem: () => null }, SIZE_KEY: 'size', POS_KEY: 'position', _spShadow: { activeElement: null },
       getComputedStyle: () => ({ top: `${safeTop}px`, bottom: `${safeBottom}px` }) };
     runInNewContext(source.slice(start, end), context);
     context.syncPanelViewport();
@@ -111,7 +113,7 @@ test('normal mobile sync keeps viewport margins with one safe-area inset and ign
     assert.equal(sheet.style.height, '764px');
     assert.equal(sheet.style.top, '20px');
     assert.equal(sheet.style.left, `${width / 2}px`);
-    assert.equal(root.style.transform, 'translate(0px, 500px)', '主宿主补到视口原点，原手机坐标不变');
+    assert.equal(root.style.transform, '', '手机主窗保持原视口 fixed 层');
     const original = { ...sheet.style };
     nodes.chat = rect(100, 300, 100, 50);
     nodes.form_sheld = rect(100, 350, 100, 400);
@@ -127,6 +129,20 @@ test('normal mobile sync keeps viewport margins with one safe-area inset and ign
     context.syncPanelViewport();
     assert.equal(sheet.style.height, '305px');
     assert.equal(sheet.style.top, '80px');
+    assert.equal(root.style.transform, '', '内部输入后可视视口收缩不会新增 fixed 包含块');
+    originTop = -500;
+    win.innerWidth = 900;
+    win.visualViewport = { offsetLeft: 0, offsetTop: 0, width: 900, height: 844 };
+    context.syncPanelViewport();
+    assert.equal(root.style.transform, 'translate(0px, 500px)', '桌面继续补偿原点');
+    win.innerWidth = width;
+    win.visualViewport = { offsetLeft: 0, offsetTop: 260, width, height: 350 };
+    context.syncPanelViewport();
+    assert.equal(root.style.transform, '', '手机 visualViewport 平移不被重复补偿');
+    originTop = 0; context.syncPanelViewport();
+    assert.equal(root.style.transform, '', '恢复零原点时清掉桌面遗留补偿');
+    assert.equal(sheet.style.top, '310px');
+    assert.equal(sheet.style.height, '255px');
   }
 });
 
@@ -141,8 +157,8 @@ test('document capture consumes only a completed dismissing click and never hand
   assert.ok(capture.every(([, options]) => options === true));
   assert.equal(target.listeners.has('wheel'), false);
   child = true; click(); assert.equal(prevented, 0); assert.equal(closes, 0);
-  child = false; click(); assert.equal(closes, 1); assert.equal(prevented, 1); assert.equal(stopped, 1);
-  click(); assert.equal(closes, 1); assert.equal(prevented, 1);
+  child = false; click(); assert.equal(closes, 1); assert.equal(prevented, 0); assert.equal(stopped, 0);
+  click(); assert.equal(closes, 1); assert.equal(prevented, 0);
 });
 
 test('main desktop layer passes hit testing while sheet and mobile backdrop retain their interaction', () => {
@@ -184,7 +200,7 @@ test('production main panel outside-close follows current640 breakpoint without 
   target.emit('pointerdown'); win.innerWidth = 390; target.emit('pointerup'); target.emit('click');
   assert.equal(closes, 0, 'desktop-down does not become a mobile close');
   for (const width of [640, 390]) { host.style.display = 'block'; win.innerWidth = width; click(); }
-  assert.equal(closes, 2); assert.equal(consumed, 2);
+  assert.equal(closes, 2); assert.equal(consumed, 0);
 });
 
 test('dialog viewport sizing compensates transformed roots and document scroll independently of the main panel', () => {
@@ -209,11 +225,11 @@ test('dialog viewport sizing compensates transformed roots and document scroll i
 
 test('production viewport sync updates an independent dialog while the main panel is hidden', () => {
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const start = source.indexOf('function syncPanelViewport() {');
+  const start = source.indexOf('function syncPanelViewport(');
   const end = source.indexOf('// ─── Toast (top)', start);
   const host = { style: {}, getBoundingClientRect: () => rect(0, -400, 820, 0) };
   const root = { style: { display: 'none' } };
-  const context = { document: { getElementById: id => id === 'dialog' ? host : root },
+  const context = { windowDiagnostics: null, document: { getElementById: id => id === 'dialog' ? host : root },
     DIALOG_HOST_ID: 'dialog', MODAL_ID: 'panel', inEl: () => null,
     syncDialogViewport: node => layout.syncDialogViewport(node, { innerWidth: 820, innerHeight: 1180 }) };
   runInNewContext(source.slice(start, end), context);
@@ -236,10 +252,189 @@ test('foreign standard dialogs and popup semantics retain clicks while fixed-bod
     const popup = selector === '[popover]' ? { popover: 'auto', matches: value => value === ':popover-open' }
       : selector === '[aria-haspopup]' ? { getAttribute: name => name === 'aria-haspopup' ? 'menu' : null }
         : { matches: selectors => selectors.split(',').map(value => value.trim()).includes(selector === 'input[list]' ? 'input' : selector) };
+    const before = closes;
     click([{}, popup, target]);
-    assert.equal(closes, 0, selector); assert.equal(blocked, 0, selector);
+    const protectedWindow = ['dialog', '[role~="dialog"]', '[role~="alertdialog"]', '[role~="menu"]', '[role~="listbox"]', '[role~="combobox"]', '[popover]'].includes(selector);
+    assert.equal(closes, before + (protectedWindow ? 0 : 1), selector); assert.equal(blocked, 0, selector);
   }
+  const beforeBody = closes;
   const fixedBody = { matches: () => false, style: { position: 'fixed' } };
-  click([panel, fixedBody, target]); assert.equal(closes, 0, 'own panel remains internal');
-  click([fixedBody, target]); assert.equal(closes, 1, 'ordinary fixed ancestors are not foreign popups');
+  click([panel, fixedBody, target]); assert.equal(closes, beforeBody, 'own panel remains internal');
+  click([fixedBody, target]); assert.equal(closes, beforeBody + 1, 'ordinary fixed ancestors are not foreign popups');
+});
+
+
+test('mobile host input closes without consuming the click, while redirected panel taps stay harmless', () => {
+  const target = new Target(), panel = { getBoundingClientRect: () => ({ left: 10, top: 20, width: 370, height: 764 }) };
+  let closes = 0, blocked = 0;
+  layout.bindOutsideClose({ target, panel, close: () => closes++ });
+  const input = { matches: selectors => selectors.split(',').includes('input') };
+  for (const type of ['pointerdown', 'pointerup', 'click']) target.emit(type, { composedPath: () => [input, target],
+    preventDefault: () => blocked++, stopImmediatePropagation: () => blocked++ });
+  assert.equal(closes, 1); assert.equal(blocked, 0, 'host input receives its original click');
+  for (const type of ['pointerdown', 'pointerup']) target.emit(type, { clientX: 4, clientY: 400, composedPath: () => [panel, target] });
+  target.emit('click', { clientX: 12, clientY: 400, composedPath: () => [panel, target],
+    preventDefault: () => blocked++, stopImmediatePropagation: () => blocked++ });
+  assert.equal(closes, 2, 'outside physical endpoints remain outside after browser touch adjustment');
+  assert.equal(blocked, 2, 'retargeted own-panel action is consumed');
+});
+
+test('mobile internal text focus follows keyboard geometry, page scrolling and rotation', () => {
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function bindViewportSync() {'), end = source.indexOf('// ─── Toast (top)', start);
+  const frames = new Map(); let nextFrame = 0, originTop = 0;
+  const win = new Target(); Object.assign(win, { innerWidth: 390, innerHeight: 844,
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; }, cancelAnimationFrame(id) { frames.delete(id); } });
+  win.visualViewport = new Target(); Object.assign(win.visualViewport, { offsetLeft: 0, offsetTop: 0, width: 390, height: 844 });
+  const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback()); };
+  const root = { style: {}, getBoundingClientRect: () => rect(0, originTop, 390, 844) }, sheet = { style: {} }, shadow = { activeElement: null };
+  const dialog = { style: {}, getBoundingClientRect() { return { left: parseFloat(this.style.left) || 0, top: parseFloat(this.style.top) || 0 }; } };
+  const document = { getElementById: id => id === 'panel' ? root : id === 'dialog' ? dialog : null,
+    createElement: () => ({ style: {} }), body: { appendChild() {}, removeChild() {} } };
+  const context = { document, window: win, windowDiagnostics: null, MODAL_ID: 'panel', DIALOG_HOST_ID: 'dialog', _spShadow: shadow,
+    inEl: () => sheet, isMobile: () => win.innerWidth <= 640, settingsOpen: false,
+    readPanelViewport: layout.readPanelViewport, syncDialogViewport: host => layout.syncDialogViewport(host, win), fitDesktopPanel: layout.fitDesktopPanel,
+    localStorage: { getItem: () => null }, SIZE_KEY: 'size', POS_KEY: 'position',
+    getComputedStyle: () => ({ top: '0px', bottom: '0px' }), closeActionMenus() {}, onDragEnd() {}, onResizeEnd() {} };
+  runInNewContext('let viewportSyncBound=false,viewportSyncFrame=null;'+source.slice(start, end), context);
+  context.bindViewportSync(); context.syncPanelViewport(); const before = { ...sheet.style };
+  win.emit('resize', { type: 'resize' });
+  shadow.activeElement = { tagName: 'TEXTAREA' }; originTop = -260;
+  Object.assign(win.visualViewport, { offsetTop: 260, height: 350 }); flush();
+  assert.equal(sheet.style.height, '270px', '键盘打开时仍重算面板高度');
+  assert.equal(sheet.style.top, '280px', '面板顶部跟随可视视口');
+  assert.equal(root.style.transform, ''); assert.equal(dialog.style.height, '350px');
+  for (const control of [{ tagName: 'INPUT', type: 'password' }, { isContentEditable: true }]) {
+    shadow.activeElement = control; win.visualViewport.height -= 10; win.visualViewport.emit('resize', { type: 'resize' }); flush(); assert.equal(sheet.style.height, `${win.visualViewport.height - 80}px`);
+  }
+  originTop = -500; win.visualViewport.offsetTop = 0;
+  win.visualViewport.emit('scroll', { type: 'scroll' }); flush(); assert.equal(root.style.transform, '', '键盘/页面平移不把根窗推到屏外');
+  document.activeElement = { tagName: 'TEXTAREA' }; shadow.activeElement = null; win.emit('resize', { type: 'resize' }); flush();
+  assert.equal(sheet.style.height, '250px'); assert.equal(root.style.transform, '');
+  for (const control of [...['checkbox', 'radio', 'range', 'button', 'color', 'file'].map(type => ({ tagName: 'INPUT', type })),
+    { tagName: 'TEXTAREA', readOnly: true }, { tagName: 'INPUT', type: 'text', readOnly: true }, { tagName: 'SELECT' }]) {
+    shadow.activeElement = control; win.visualViewport.height++;
+    win.visualViewport.emit('resize', { type: 'resize' }); flush(); assert.equal(sheet.style.height, `${win.visualViewport.height - 80}px`, JSON.stringify(control));
+  }
+  shadow.activeElement = { tagName: 'INPUT', type: 'text' }; win.visualViewport.height = 400;
+  win.visualViewport.emit('resize', { type: 'resize' }); win.emit('orientationchange', { type: 'orientationchange' }); flush();
+  assert.equal(sheet.style.height, '320px', '旋转覆盖已排队的键盘resize');
+  win.visualViewport.height = 450; context.syncPanelViewport(); assert.equal(sheet.style.height, '370px');
+  win.innerWidth = 1200; win.visualViewport.width = 1200; win.visualViewport.height = 900;
+  win.emit('resize', { type: 'resize' }); flush(); assert.equal(sheet.style.height, '600px');
+  win.innerWidth = 390; win.visualViewport.width = 390; win.visualViewport.height = 350;
+  originTop = -400; win.scrollY = 400; shadow.activeElement = { tagName: 'TEXTAREA' };
+  win.emit('scroll', { type: 'scroll' }); flush();
+  assert.equal(root.style.transform, 'translate(0px, 400px)', '内部输入时仍补偿真实页面滚动');
+  assert.equal(sheet.style.height, '270px');
+  originTop = 0; win.scrollY = 0; win.visualViewport.offsetTop = 260;
+  win.visualViewport.emit('scroll', { type: 'scroll' }); flush();
+  assert.equal(root.style.transform, '', '键盘平移沿用可视视口坐标');
+  assert.equal(sheet.style.top, '280px');
+});
+
+const phoneSafariAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
+const phoneFirefoxAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/145.0 Mobile/15E148 Safari/605.1.15';
+
+function editingViewportFixture(userAgent = phoneSafariAgent, width = 390) {
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function bindViewportSync() {'), end = source.indexOf('// ─── Toast (top)', start);
+  const frames = new Map(); let nextFrame = 0;
+  const win = new Target(); Object.assign(win, { innerWidth: width, innerHeight: 844,
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); } });
+  win.visualViewport = new Target(); Object.assign(win.visualViewport, { offsetLeft: 0, offsetTop: 0, width, height: 844 });
+  const root = { style: {}, getBoundingClientRect: () => rect(0, 0, width, 844) }, sheet = { style: {} }, shadow = { activeElement: null };
+  const dialog = { style: {}, getBoundingClientRect() { return { left: parseFloat(this.style.left) || 0, top: parseFloat(this.style.top) || 0 }; } };
+  const document = { getElementById: id => id === 'panel' ? root : id === 'dialog' ? dialog : null,
+    createElement: () => ({ style: {} }), body: { appendChild() {}, removeChild() {} } };
+  const context = { document, window: win, windowDiagnostics: null, navigator: { userAgent }, MODAL_ID: 'panel', DIALOG_HOST_ID: 'dialog', _spShadow: shadow,
+    inEl: () => sheet, isMobile: () => win.innerWidth <= 640, settingsOpen: false,
+    readPanelViewport: layout.readPanelViewport, syncDialogViewport: host => layout.syncDialogViewport(host, win), fitDesktopPanel: layout.fitDesktopPanel,
+    localStorage: { getItem: () => null }, SIZE_KEY: 'size', POS_KEY: 'position',
+    getComputedStyle: () => ({ top: '0px', bottom: '0px' }), closeActionMenus() {}, onDragEnd() {}, onResizeEnd() {} };
+  runInNewContext('let viewportSyncBound=false,viewportSyncFrame=null;'+source.slice(start, end), context);
+  context.bindViewportSync(); context.syncPanelViewport();
+  return { win, root, sheet, shadow, dialog, document, context,
+    flush() { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback()); } };
+}
+
+test('phone Safari preserves main geometry during native input panning while dialogs still resize', () => {
+  const { win, root, sheet, shadow, dialog, context, flush } = editingViewportFixture();
+  const before = { ...sheet.style }, rootBefore = { ...root.style };
+  win.emit('resize', { type: 'resize' });
+  shadow.activeElement = { tagName: 'TEXTAREA' };
+  root.getBoundingClientRect = () => rect(0, -500, 390, 844);
+  Object.assign(win.visualViewport, { height: 350, offsetTop: 0 }); flush();
+  assert.deepEqual(sheet.style, before, 'queued keyboard resize must read the current shadow focus');
+  assert.deepEqual(root.style, rootBefore, 'native input panning must not change the fixed containing block');
+  assert.equal(dialog.style.height, '350px', 'independent dialogs continue to follow the keyboard viewport');
+  for (const control of [{ tagName: 'INPUT', type: 'password' }, { isContentEditable: true }]) {
+    shadow.activeElement = control; win.visualViewport.offsetTop += 10;
+    win.visualViewport.emit('scroll', { type: 'scroll' }); flush(); assert.deepEqual(sheet.style, before);
+  }
+  shadow.activeElement = null; root.getBoundingClientRect = () => rect(0, 0, 390, 844);
+  Object.assign(win.visualViewport, { height: 844, offsetTop: 0 });
+  win.visualViewport.emit('resize', { type: 'resize' }); flush();
+  assert.deepEqual(sheet.style, before, 'normal viewport synchronization resumes after editing');
+  shadow.activeElement = { tagName: 'TEXTAREA' }; win.visualViewport.height = 400;
+  context.syncPanelViewport(); assert.equal(sheet.style.height, '320px', 'explicit opening still positions the panel');
+  win.emit('resize', { type: 'resize' }); shadow.activeElement = null; win.visualViewport.height = 450;
+  flush(); assert.equal(sheet.style.height, '370px', 'queued events must also notice focus leaving before execution');
+});
+
+test('phone Safari rotation overrides queued keyboard events and non-editable controls keep synchronizing', () => {
+  const { win, sheet, shadow, document, flush } = editingViewportFixture();
+  shadow.activeElement = { tagName: 'TEXTAREA' }; win.visualViewport.height = 350;
+  win.emit('resize', { type: 'resize' }); win.emit('orientationchange', { type: 'orientationchange' }); flush();
+  assert.equal(sheet.style.height, '270px', 'rotation must not inherit a queued editing freeze');
+  win.visualViewport.height = 400;
+  win.emit('orientationchange', { type: 'orientationchange' }); win.emit('resize', { type: 'resize' }); flush();
+  assert.equal(sheet.style.height, '320px', 'later keyboard events must not replace a queued rotation');
+  for (const control of [{ tagName: 'TEXTAREA', readOnly: true }, { tagName: 'INPUT', type: 'text', readOnly: true },
+    ...['checkbox', 'radio', 'range', 'button', 'color', 'file'].map(type => ({ tagName: 'INPUT', type })), { tagName: 'SELECT' }, null]) {
+    shadow.activeElement = control; win.visualViewport.height++;
+    win.visualViewport.emit('resize', { type: 'resize' }); flush(); assert.equal(sheet.style.height, `${win.visualViewport.height - 80}px`);
+  }
+  document.activeElement = { tagName: 'TEXTAREA' }; shadow.activeElement = null; win.visualViewport.height = 450;
+  win.emit('resize', { type: 'resize' }); flush(); assert.equal(sheet.style.height, '370px', 'host input does not freeze our panel');
+});
+
+test('phone Firefox also preserves editing geometry and still follows explicit rotation', () => {
+  const { win, sheet, shadow, flush } = editingViewportFixture(phoneFirefoxAgent);
+  const before = { ...sheet.style };
+  shadow.activeElement = { tagName: 'TEXTAREA' }; win.visualViewport.height = 350;
+  win.visualViewport.emit('resize', { type: 'resize' }); flush();
+  assert.deepEqual(sheet.style, before, 'FxiOS without Version must receive the phone editing behavior');
+  win.emit('orientationchange', { type: 'orientationchange' }); flush();
+  assert.equal(sheet.style.height, '270px');
+});
+
+test('window diagnostics observe the actual preserved, applied and hidden viewport paths', () => {
+  const { win, root, shadow, context, flush } = editingViewportFixture(phoneFirefoxAgent);
+  const records = []; context.windowDiagnostics = { record: (event, decision) => records.push({ event, decision }) };
+  shadow.activeElement = { tagName: 'TEXTAREA' }; win.visualViewport.height = 350;
+  win.emit('resize', { type: 'resize' }); flush();
+  assert.deepEqual(records.map(item => item.event), ['sync.requested', 'sync.preserved']);
+  assert.equal(records.at(-1).decision.mobile, true);
+  win.emit('orientationchange', { type: 'orientationchange' }); flush();
+  assert.equal(records.at(-1).event, 'sync.applied'); assert.equal(records.at(-1).decision.preserveEditingGeometry, false);
+  root.style.display = 'none'; context.syncPanelViewport(); assert.equal(records.at(-1).event, 'sync.inactive');
+});
+
+test('the phone editing change leaves Android, Chrome iOS, desktop and iPad geometry unchanged', () => {
+  const cases = [
+    ['Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/142.0 Mobile Safari/537.36', 390],
+    ['Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/142.0 Mobile/15E148 Safari/604.1', 390],
+    ['Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148', 390],
+    ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.0 Safari/605.1.15', 1200],
+    ['Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Version/26.0 Mobile/15E148 Safari/604.1', 820],
+    [phoneSafariAgent, 844],
+  ];
+  for (const [agent, width] of cases) {
+    const { win, sheet, shadow, flush } = editingViewportFixture(agent, width);
+    shadow.activeElement = { tagName: 'TEXTAREA' }; win.visualViewport.height = 350;
+    win.visualViewport.emit('resize', { type: 'resize' }); flush();
+    assert.equal(sheet.style.height, width <= 640 ? '270px' : '330px', `${width}: ${agent}`);
+  }
 });
